@@ -188,3 +188,4 @@
 "Once" = "Один раз"
 "The original audio is not available" = "Исходный звук недоступен"
 "Could not write the trimmed file" = "Не удалось записать обрезанный файл"
+"Pump" = "Насос"

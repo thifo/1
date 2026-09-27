@@ -85,7 +85,7 @@ namespace thf::grain
     inline const juce::StringArray syncRateChoices { "1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/64" };
     inline const juce::StringArray voiceModeChoices{ "Poly", "Mono", "Legato" };
     inline const juce::StringArray filterChoices   { "Low Pass", "Band Pass", "High Pass" };
-    inline const juce::StringArray lfoShapeChoices { "Sine", "Triangle", "Saw", "Square", "Random" };
+    inline const juce::StringArray lfoShapeChoices { "Sine", "Triangle", "Saw", "Square", "Random", "Pump" };
     inline const juce::StringArray modTargetChoices{ "Position", "Spray", "Size", "Density", "Pitch", "Cutoff", "Level" };
     inline const juce::StringArray quantizeChoices { "Off", "Octaves", "Fifths", "Major", "Minor" };
     inline const juce::StringArray lfoModeChoices  { "Free", "Sync" };

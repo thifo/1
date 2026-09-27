@@ -446,6 +446,19 @@ namespace thf::grain::dsp
             return kMax * std::pow (kMin / kMax, std::fmin (std::fmax (resonance, 0.0f), 1.0f));
         }
 
+        // Fixed damping (k = 1 / Q) and unity gain: for built-in sources that need a known Q,
+        // whatever the Resonance knob's curve is.
+        void setQ (float cutoff, float q, float sampleRate) noexcept
+        {
+            cutoff = std::fmin (std::fmax (cutoff, 10.0f), 0.49f * sampleRate);
+            const auto g = std::tan (pi * cutoff / sampleRate);
+            k = 1.0f / std::fmax (0.05f, q);
+            gain = 1.0f;
+            a1 = 1.0f / (1.0f + g * (g + k));
+            a2 = g * a1;
+            a3 = g * a2;
+        }
+
         void set (float cutoff, float resonance, float sampleRate) noexcept
         {
             cutoff = std::fmin (std::fmax (cutoff, 10.0f), 0.49f * sampleRate);
@@ -498,7 +511,7 @@ namespace thf::grain::dsp
     class Lfo
     {
     public:
-        enum class Shape { sine, triangle, saw, square, random };
+        enum class Shape { sine, triangle, saw, square, random, pump };
 
         void reset (Random& rng) noexcept { phase = 0.0; cycle = 0; held = rng.bipolar(); }
 
@@ -528,6 +541,13 @@ namespace thf::grain::dsp
                 case Shape::saw:      return 2.0f * p - 1.0f;
                 case Shape::square:   return p < 0.5f ? 1.0f : -1.0f;
                 case Shape::random:   return held;
+                case Shape::pump:
+                {
+                    // Sidechain-style duck: down at the start of each cycle, back up by 35 %
+                    // with a squared curve (on Level: 1 - depth at the beat, full from 35 %).
+                    const auto g = std::fmax (0.0f, 1.0f - p / 0.35f);
+                    return 1.0f - 2.0f * g * g;
+                }
             }
             return 0.0f;
         }

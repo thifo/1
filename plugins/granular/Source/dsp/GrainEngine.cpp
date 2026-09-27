@@ -30,7 +30,10 @@ namespace thf::grain
         switchFadeSamples = juce::jmax (16, (int) (0.008 * sampleRate));
         controlLength = juce::jlimit (16, maxControlBlock, (int) std::lround (32.0 * sampleRate / 48000.0));
         typeFadeLength = juce::jmax (16, (int) (0.005 * sampleRate));
-        reverb.setSampleRate (sampleRate);
+        reverb.prepare (sampleRate);
+        limiter.prepare (sampleRate);
+        sideCoefs[0].setQ (200.0f, 0.5412f, (float) sampleRate);   // Butterworth, 4th order
+        sideCoefs[1].setQ (200.0f, 1.3066f, (float) sampleRate);
         drive.prepare (sampleRate);
         reset();
     }
@@ -115,7 +118,10 @@ namespace thf::grain
         sampleClock = 0;
         filterTypeNow = -1;
         typeFadeLeft = 0;
-        reverbTail = 0;
+        reverbRunning = false;
+        limiter.reset();
+        sideHighPass[0].reset();
+        sideHighPass[1].reset();
         levelSmoothed = 1.0f;
         globalScan = 0.0;
         monoCount = 0;
@@ -929,26 +935,24 @@ namespace thf::grain
                 drive.process (L, R, len, start, driveSmoothed);
             }
 
-            // Space: plate-like reverb after the drive. Dry stays at unity so switching the
-            // reverb in and out is seamless; it keeps running while its tail rings out.
+            // Space after the drive: added to the dry signal, which is never touched.
             if (p.space > 1.0e-3f)
-                reverbTail = (int) (6.0 * sampleRate);
-            if (reverbTail > 0)
+                reverbRunning = true;
+            if (reverbRunning)
             {
-                juce::Reverb::Parameters rp;
-                rp.roomSize = 0.55f + 0.44f * p.spaceSize;
-                rp.damping = 0.45f;
-                rp.wetLevel = p.space * 0.36f;
-                rp.dryLevel = 0.5f;          // x2 inside juce::Reverb = unity
-                rp.width = 1.0f;
-                rp.freezeMode = 0.0f;
-                if (std::abs (rp.roomSize - reverbParams.roomSize) > 1.0e-4f || std::abs (rp.wetLevel - reverbParams.wetLevel) > 1.0e-4f)
-                {
-                    reverb.setParameters (rp);
-                    reverbParams = rp;
-                }
-                reverb.processStereo (L, R, len);
-                reverbTail -= len;
+                reverb.process (L, R, len, p.space, p.spaceSize);
+                if (p.space <= 1.0e-3f && ! reverb.isRinging())
+                    reverbRunning = false;
+            }
+
+            // Low end in mono: the side signal is high-passed at 200 Hz (4th order, -10 dB at
+            // 150 Hz), so the bass sums to mono and survives mono playback.
+            for (int i = 0; i < len; ++i)
+            {
+                const auto mid = 0.5f * (L[i] + R[i]);
+                const auto side = sideHighPass[1].processAll (sideHighPass[0].processAll (0.5f * (L[i] - R[i]), sideCoefs[0]).hp, sideCoefs[1]).hp;
+                L[i] = mid + side;
+                R[i] = mid - side;
             }
 
             // Level modulation (pump) and output gain, both ramped across the block.
@@ -962,9 +966,9 @@ namespace thf::grain
                 R[i] *= lv;
             }
 
-            // Output gain ramps linearly across the control block. The fixed -6 dB leaves room
-            // for several voices of dense, correlated grains before Safe Clip has to act.
-            constexpr float headroom = 0.5f;
+            // Output gain ramps linearly across the control block. The fixed -3 dB leaves room
+            // for several voices before the limiter (Safe Clip) has to act.
+            constexpr float headroom = 0.708f;
             const auto startGain = gainSmoothed;
             gainSmoothed += (p.outputGain - gainSmoothed) * (1.0f - std::exp (-(float) len / (0.01f * (float) sampleRate)));
             const auto gainStep = (gainSmoothed - startGain) / (float) len;
@@ -991,11 +995,19 @@ namespace thf::grain
                                                  : juce::jmax (target, fadeGain - fadeStep);
                 const auto gain = (startGain + gainStep * (float) (i + 1)) * headroom * fadeGain;
                 auto l = L[i] * gain, r = R[i] * gain;
-                if (p.safeClip) { l = safeClip (l); r = safeClip (r); }
                 if (! std::isfinite (l) || ! std::isfinite (r)) { l = r = 0.0f; bad = true; }
                 L[i] = l;
                 R[i] = r;
             }
+
+            // Safe Clip: look-ahead limiter to -0.5 dBFS, then the soft clipper as a ceiling.
+            limiter.process (L, R, len, p.safeClip);
+            if (p.safeClip)
+                for (int i = 0; i < len; ++i)
+                {
+                    L[i] = safeClip (L[i]);
+                    R[i] = safeClip (R[i]);
+                }
             if (bad)
             {
                 // Something blew up (should never happen): silence and clear every state that
@@ -1008,6 +1020,9 @@ namespace thf::grain
                 }
                 drive.reset();
                 reverb.reset();
+                limiter.reset();
+                sideHighPass[0].reset();
+                sideHighPass[1].reset();
                 levelSmoothed = 1.0f;
                 gainSmoothed = -1.0f;
                 driveSmoothed = 0.0f;

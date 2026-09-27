@@ -7,6 +7,8 @@
 #include <i18n/Translator.h>
 #include <juce_dsp/juce_dsp.h>
 #include <map>
+#include <complex>
+#include <set>
 
 namespace thf::test
 {
@@ -115,6 +117,93 @@ namespace
             else wrong += e2;
         }
         return 10.0 * std::log10 ((wrong + 1.0e-30) / (right + 1.0e-30));
+    }
+
+    // Renders a factory preset through the processor (120 BPM, transport running): a held
+    // chord (poly) or one held note (mono) from `notes`, `seconds` long, stereo.
+    juce::AudioBuffer<float> renderPreset (const juce::String& name, std::vector<int> notes, double seconds, double holdSeconds = 4.0,
+                                           bool line = false)
+    {
+        struct Transport : juce::AudioPlayHead
+        {
+            double ppq = 0.0;
+            juce::Optional<PositionInfo> getPosition() const override
+            {
+                PositionInfo info;
+                info.setBpm (120.0);
+                info.setPpqPosition (ppq);
+                info.setIsPlaying (true);
+                return info;
+            }
+        } transport;
+        GrainProcessor p;
+        for (int i = 0; i < 4000 && p.getFactorySource (sourceChoices.size() - 1) == nullptr; ++i)
+            juce::Thread::sleep (5);
+        p.setPlayHead (&transport);
+        p.prepareToPlay (rate, 512);
+        const auto& list = factoryPresets();
+        for (size_t i = 0; i < list.size(); ++i)
+            if (name == list[i].name) p.getPresets().loadFactory ((int) i);
+        const int total = (int) (seconds * rate);
+        juce::AudioBuffer<float> out (2, total);
+        for (int pos = 0; pos < total; pos += 512)
+        {
+            const auto n = std::min (512, total - pos);
+            juce::MidiBuffer midi;
+            if (line)
+            {
+                // One note per second (0.95 s each), as the level tool plays mono presets.
+                for (size_t k = 0; k < notes.size(); ++k)
+                {
+                    const auto on = (int) ((double) k * rate), off = (int) (((double) k + 0.95) * rate);
+                    if (on >= pos && on < pos + n) midi.addEvent (juce::MidiMessage::noteOn (1, notes[k], 0.9f), on - pos);
+                    if (off >= pos && off < pos + n) midi.addEvent (juce::MidiMessage::noteOff (1, notes[k]), off - pos);
+                }
+            }
+            else
+            {
+                if (pos == 0) for (auto note : notes) midi.addEvent (juce::MidiMessage::noteOn (1, note, 0.85f), 0);
+                const auto off = (int) (holdSeconds * rate);
+                if (off >= pos && off < pos + n) for (auto note : notes) midi.addEvent (juce::MidiMessage::noteOff (1, note), off - pos);
+            }
+            juce::AudioBuffer<float> block (2, n);
+            block.clear();
+            p.processBlock (block, midi);
+            transport.ppq += n / rate * 2.0;
+            for (int ch = 0; ch < 2; ++ch) out.copyFrom (ch, pos, block, ch, 0, n);
+        }
+        p.setPlayHead (nullptr);
+        return out;
+    }
+
+    // Energy per pitch class (0 = C) of the mono mix between from and to seconds, only in
+    // [loHz, hiHz] (fundamentals, before the harmonics blur the picture).
+    std::array<double, 12> chroma (const juce::AudioBuffer<float>& b, double from, double to, double loHz, double hiHz)
+    {
+        constexpr int order = 15, size = 1 << order;
+        juce::dsp::FFT fft (order);
+        std::array<double, 12> result {};
+        for (auto start = (int) (from * rate); start + size <= (int) (to * rate) || start == (int) (from * rate); start += size / 2)
+        {
+            std::vector<float> data (2 * size, 0.0f);
+            for (int i = 0; i < size && start + i < b.getNumSamples(); ++i)
+                data[(size_t) i] = 0.5f * (b.getSample (0, start + i) + b.getSample (1, start + i))
+                                   * (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi * (float) i / size));
+            fft.performFrequencyOnlyForwardTransform (data.data());
+            for (int bin = 1; bin < size / 2; ++bin)
+            {
+                const auto hz = bin * rate / size;
+                if (hz < loHz || hz > hiHz) continue;
+                // Only near a note (within 35 cents): detuned unison voices between two notes
+                // belong to neither.
+                const auto note = 69.0 + 12.0 * std::log2 (hz / 440.0);
+                if (std::abs (note - std::round (note)) > 0.35) continue;
+                const auto pc = ((int) std::lround (note) % 12 + 12) % 12;
+                result[(size_t) pc] += (double) data[(size_t) bin] * data[(size_t) bin];
+            }
+            if (start + size >= (int) (to * rate)) break;
+        }
+        return result;
     }
 
     float maxStep (const std::vector<float>& x)
@@ -708,6 +797,65 @@ public:
             const auto db = juce::Decibels::gainToDecibels (level (0.5f) / level (0.0f));
             logMessage ("  pressure 0.5 on Level: " + juce::String (db, 1) + " dB");
             expectWithinAbsoluteError (db, -6.0, 0.5);
+        }
+
+        beginTest ("Pump: the level ducks at each beat within 5 ms and is back by 35 %");
+        {
+            auto src = noiseSource (4.0);             // dense noise: a steady level to watch
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.spray = 1.0f; p.chaos = 1.0f; p.density = 200.0f; p.sizeMs = 100.0f;
+            p.lfoTarget = 6; p.lfoShape = 5; p.lfoDepth = 1.0f; p.lfoSync = true; p.lfoBeats = 1.0; p.bpm = 120.0;
+            e.noteOn (57, 1.0f, p);
+            e.syncLfo (0.5, 1.0);                        // half a beat before the next one
+            const auto out = render (e, p, (int) rate);
+            auto rmsAt = [&out] (double from, double to)
+            {
+                double s2 = 0.0;
+                for (auto i = (int) (from * rate); i < (int) (to * rate); ++i) s2 += out[(size_t) i] * out[(size_t) i];
+                return 10.0 * std::log10 (s2 / ((to - from) * rate) + 1.0e-20);
+            };
+            const auto beat = 0.25, beatLength = 0.5;         // next beat at 0.25 s; 0.5 s per beat
+            const auto before = rmsAt (beat - 0.08, beat - 0.005), dip = rmsAt (beat + 0.005, beat + 0.012),
+                       back = rmsAt (beat + 0.37 * beatLength, beat + 0.95 * beatLength);
+            logMessage ("  before " + juce::String (before, 1) + ", 5 ms after the beat " + juce::String (dip, 1)
+                        + ", at 36 % " + juce::String (back, 1) + " dB");
+            expectLessThan (dip - before, -12.0);
+            expectWithinAbsoluteError (back, before, 1.5);
+        }
+
+        beginTest ("Safe Clip: nothing above the ceiling; the reverb rings on after Space goes to 0");
+        {
+            thf::grain::dsp::Limiter limiter;
+            limiter.prepare (rate);
+            std::vector<float> l (4800), r (4800);
+            float peakOut = 0.0f;
+            for (int block = 0; block < 20; ++block)
+            {
+                for (int i = 0; i < 4800; ++i)
+                    l[(size_t) i] = r[(size_t) i] = 3.0f * std::sin (0.05f * (float) (block * 4800 + i)) * (i % 700 == 0 ? 2.0f : 1.0f);
+                limiter.process (l.data(), r.data(), 4800, true);
+                for (auto v : l) peakOut = std::max (peakOut, std::abs (v));
+            }
+            expectLessOrEqual (peakOut, thf::grain::dsp::Limiter::ceiling + 1.0e-4f);
+
+            thf::grain::dsp::SpaceReverb reverb;
+            reverb.prepare (rate);
+            std::vector<float> a (512, 0.0f), b (512, 0.0f);
+            a[0] = b[0] = 1.0f;
+            reverb.process (a.data(), b.data(), 512, 0.5f, 0.6f);
+            expectEquals (a[0], 1.0f);                                    // dry untouched, wet comes later
+            double tail = 0.0;
+            for (int block = 0; block < 40; ++block)                      // Space now 0: the tail keeps ringing
+            {
+                std::fill (a.begin(), a.end(), 0.0f);
+                std::fill (b.begin(), b.end(), 0.0f);
+                reverb.process (a.data(), b.data(), 512, 0.0f, 0.6f);
+                if (block > 20) for (auto v : a) tail += v * v;
+            }
+            expect (tail > 1.0e-6 && reverb.isRinging());
         }
 
         beginTest ("Grain boundaries do not click (Hann and flat windows)");
@@ -1780,6 +1928,104 @@ public:
             expect (p.isPreviewing() && buffer.getMagnitude (0, 0, 512) > 0.01f);
             p.stopPreview();
             file.deleteFile();
+        }
+
+        beginTest ("Chord presets: a Cmaj7 chord stays Cmaj7 (other notes below -12 dB)");
+        {
+            const std::pair<const char*, std::vector<int>> cases[] = {
+                { "Warm Chord Cloud", { 60, 64, 67, 71 } }, { "Warble Pad", { 60, 64, 67, 71 } },
+                { "Pumping Chords", { 60, 64, 67, 71 } }, { "Wobble Chords", { 60, 64, 67, 71 } },
+                { "Tape Chords", { 60, 64, 67, 71 } }, { "Reverse Swell", { 60, 64, 67, 71 } },
+                { "Neon Stab Chords", { 60, 64, 67, 71 } }, { "Sidechain Saw Wall", { 60, 64, 67, 71 } },
+                { "Future Stab", { 60 } }, { "Chord Freeze", { 60 } } };   // one key plays the stack's chord
+            for (auto& [presetName, notes] : cases)
+            {
+                const auto b = renderPreset (presetName, notes, 3.0, 3.0);
+                const auto c = chroma (b, 0.8, 2.8, 200.0, 700.0);
+                const std::set<int> allowed = notes.size() > 1 ? std::set<int> { 0, 4, 7, 11 } : std::set<int> { 0, 2, 4, 7, 11 };
+                double loudest = 0.0, foreign = 0.0;
+                for (int pc = 0; pc < 12; ++pc)
+                {
+                    loudest = std::max (loudest, c[(size_t) pc]);
+                    if (allowed.count (pc) == 0) foreign = std::max (foreign, c[(size_t) pc]);
+                }
+                const auto db = 10.0 * std::log10 (foreign / loudest + 1.0e-30);
+                logMessage ("  " + juce::String (presetName) + ": other notes " + juce::String (db, 1) + " dB");
+                expectLessThan (db, -12.0, presetName);
+            }
+        }
+
+        beginTest ("Vocal presets on the key C sound in C");
+        {
+            for (auto* presetName : { "Vox Lead", "Breathy Vox Pad", "Pitched Stutter", "Hyper Vox Lead", "Syllable Stutter",
+                                      "Ghost Garage Vox", "Lofi Keys", "Dusty Tape Keys" })
+            {
+                const auto b = renderPreset (presetName, { 60 }, 1.5, 1.5);
+                const auto c = chroma (b, 0.1, 1.4, 90.0, 1100.0);
+                const auto strongest = (int) (std::max_element (c.begin(), c.end()) - c.begin());
+                logMessage ("  " + juce::String (presetName) + ": strongest pitch class " + juce::String (strongest));
+                expectEquals (strongest, 0, presetName);
+            }
+        }
+
+        beginTest ("Every preset: loudness -16 dB +/- 1.5, Output below +10, low end in mono");
+        {
+            for (const auto& preset : factoryPresets())
+            {
+                if (juce::String (preset.name) == "Init") continue;
+                const bool mono = std::any_of (preset.values.begin(), preset.values.end(), [] (auto& v)
+                                               { return juce::String (v.first) == pid::voiceMode && v.second > 0.5f; });
+                const bool bass = juce::String (preset.category) == "Bass";
+                const auto base = bass ? 48 : 60;
+                const auto notes = mono ? std::vector<int> { base, base + 3, base + 7, base + 10 } : std::vector<int> { 60, 64, 67, 71 };
+                const auto b = renderPreset (preset.name, notes, 4.5, 4.0, mono);
+                // Loudest 400 ms.
+                double loudest = 0.0;
+                const int window = (int) (0.4 * rate), step = (int) (0.1 * rate);
+                for (int start = 0; start + window <= b.getNumSamples(); start += step)
+                {
+                    double s2 = 0.0;
+                    for (int i = start; i < start + window; ++i)
+                        for (int ch = 0; ch < 2; ++ch) s2 += (double) b.getSample (ch, i) * b.getSample (ch, i);
+                    loudest = std::max (loudest, s2 / (2.0 * window));
+                }
+                const auto db = 10.0 * std::log10 (loudest + 1.0e-20);
+                float output = 0.0f;
+                for (auto& v : preset.values) if (juce::String (v.first) == pid::output) output = v.second;
+                expectWithinAbsoluteError (db, -16.0, 2.0, juce::String (preset.name) + " " + juce::String (db, 1) + " dB");
+                expectLessThan (output, 10.0f, preset.name);
+
+                // Correlation of L and R below 150 Hz (cross-spectrum), where there is a low end.
+                double lr = 0.0, ll = 0.0, rr = 0.0, all = 0.0;
+                {
+                    constexpr int order = 14, size = 1 << order;
+                    juce::dsp::FFT fft (order);
+                    std::vector<std::complex<float>> inL ((size_t) size), inR ((size_t) size), outL ((size_t) size), outR ((size_t) size);
+                    for (int start = (int) (0.5 * rate); start + size <= b.getNumSamples(); start += size)
+                    {
+                        for (int i = 0; i < size; ++i)
+                        {
+                            const auto w = 0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi * (float) i / size);
+                            inL[(size_t) i] = b.getSample (0, start + i) * w;
+                            inR[(size_t) i] = b.getSample (1, start + i) * w;
+                        }
+                        fft.perform (inL.data(), outL.data(), false);
+                        fft.perform (inR.data(), outR.data(), false);
+                        for (int bin = 1; bin < size / 2; ++bin)
+                        {
+                            const auto hz = bin * rate / size;
+                            const auto e = std::norm (outL[(size_t) bin]) + std::norm (outR[(size_t) bin]);
+                            all += e;
+                            if (hz < 20.0 || hz > 150.0) continue;
+                            lr += (outL[(size_t) bin] * std::conj (outR[(size_t) bin])).real();
+                            ll += std::norm (outL[(size_t) bin]);
+                            rr += std::norm (outR[(size_t) bin]);
+                        }
+                    }
+                }
+                if ((ll + rr) > all * 1.0e-3)   // at least -30 dB of the whole below 150 Hz
+                    expectGreaterThan (lr / std::sqrt (ll * rr), 0.8, juce::String (preset.name) + " low-end correlation");
+            }
         }
 
         beginTest ("Factory presets load and only use known parameters");

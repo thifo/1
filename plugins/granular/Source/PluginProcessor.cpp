@@ -191,7 +191,9 @@ namespace thf::grain
 
     double GrainProcessor::getTailLengthSeconds() const
     {
-        return (raw->release->load() + raw->size->load()) * 0.001;
+        // Release and the last grain, plus the reverb's decay when Space is on.
+        const auto voice = (raw->release->load() + raw->size->load()) * 0.001;
+        return voice + (raw->space->load() > 1.0e-3f ? GrainEngine::reverbTailSeconds (raw->spaceSize->load()) : 0.0);
     }
 
     void GrainProcessor::prepareToPlay (double sampleRate, int)
@@ -200,6 +202,7 @@ namespace thf::grain
         if (std::abs (previousRate - sampleRate) > 0.5 && getUserSample() != nullptr)
             reloadForSampleRate();
         engine.prepare (sampleRate);
+        setLatencySamples (engine.getLatencySamples());
         for (auto& p : pickups) p.reset();
     }
 

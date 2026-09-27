@@ -523,15 +523,19 @@ namespace thf::grain
                 if (m > 0.0f) b.applyGain (peak / m);
             }
 
+            // Seven-voice detuned saw (a "supersaw"): the centre voice is identical in both
+            // channels, so the low end stays mono-compatible; the others spread +/- 9..38 cents
+            // with different phases per channel for width.
             juce::AudioBuffer<float> sawPad()
             {
                 const int n = (int) (genRate * genSeconds);
                 juce::AudioBuffer<float> b (2, n);
-                constexpr double cents[] = { -11.0, -4.0, 0.0, 4.5, 10.0 };
+                constexpr double cents[] = { 0.0, -9.0, 9.5, -21.0, 20.0, -38.0, 36.0 };
+                constexpr float levels[] = { 1.0f, 0.8f, 0.8f, 0.65f, 0.65f, 0.5f, 0.5f };
                 for (int ch = 0; ch < 2; ++ch)
                 {
-                    double phases[5];
-                    for (int v = 0; v < 5; ++v) phases[v] = std::fmod (0.137 * (v + 1) + 0.31 * ch, 1.0);
+                    double phases[7];
+                    for (int v = 0; v < 7; ++v) phases[v] = v == 0 ? 0.25 : std::fmod (0.137 * (v + 1) + 0.31 * ch, 1.0);
                     dsp::Svf lp1, lp2;
                     dsp::SvfCoefs c;
                     auto* d = b.getWritePointer (ch);
@@ -540,17 +544,14 @@ namespace thf::grain
                         const auto t = (double) i / n;
                         if (i % 32 == 0)
                         {
-                            const auto bright = 700.0 * std::pow (9.0, std::sin (juce::MathConstants<double>::pi * t));
-                            c.set ((float) bright, 0.15f, (float) genRate);
+                            const auto bright = 1200.0 * std::pow (8.0, std::sin (juce::MathConstants<double>::pi * t));
+                            c.setQ ((float) bright, 0.78f, (float) genRate);
                         }
                         float sum = 0.0f;
-                        for (int v = 0; v < 5; ++v)
-                        {
-                            const auto detune = cents[v] * (ch == 0 ? 1.0 : -1.0);
-                            sum += polyBlepSaw (phases[v], rootHz * std::pow (2.0, detune / 1200.0) / genRate);
-                        }
+                        for (int v = 0; v < 7; ++v)
+                            sum += levels[v] * polyBlepSaw (phases[v], rootHz * std::pow (2.0, cents[v] / 1200.0) / genRate);
                         const auto swell = 0.6f + 0.4f * (float) std::sin (juce::MathConstants<double>::pi * t);
-                        d[i] = lp2.process (lp1.process (sum * 0.2f, c, dsp::Svf::Type::lowPass), c, dsp::Svf::Type::lowPass) * swell;
+                        d[i] = lp2.process (lp1.process (sum * 0.15f, c, dsp::Svf::Type::lowPass), c, dsp::Svf::Type::lowPass) * swell;
                     }
                 }
                 normalise (b, 0.7f);
@@ -578,9 +579,9 @@ namespace thf::grain
                         const auto frac = (float) (pos - k);
                         const auto& a = vowels[k];
                         const auto& z = vowels[k + 1];
-                        c[0].set (a.f1 + frac * (z.f1 - a.f1), 0.85f, (float) genRate);
-                        c[1].set (a.f2 + frac * (z.f2 - a.f2), 0.88f, (float) genRate);
-                        c[2].set (a.f3 + frac * (z.f3 - a.f3), 0.9f, (float) genRate);
+                        c[0].setQ (a.f1 + frac * (z.f1 - a.f1), 4.00f, (float) genRate);
+                        c[1].setQ (a.f2 + frac * (z.f2 - a.f2), 4.79f, (float) genRate);
+                        c[2].setQ (a.f3 + frac * (z.f3 - a.f3), 5.52f, (float) genRate);
                     }
                     const auto vibrato = std::pow (2.0, 0.15 / 12.0 * std::sin (2.0 * juce::MathConstants<double>::pi * 5.2 * i / genRate));
                     const auto src = polyBlepSaw (phase, rootHz * vibrato / genRate);
@@ -633,7 +634,7 @@ namespace thf::grain
                     for (int i = 0; i < n; ++i)
                     {
                         if (i % 32 == 0)
-                            c.set ((float) (150.0 * std::pow (60.0, (double) i / n)), 0.35f, (float) genRate);
+                            c.setQ ((float) (150.0 * std::pow (60.0, (double) i / n)), 1.07f, (float) genRate);
                         const auto white = rng.bipolar();
                         b0 = 0.99765f * b0 + white * 0.0990460f;
                         b1 = 0.96300f * b1 + white * 0.2965164f;
@@ -700,9 +701,9 @@ namespace thf::grain
                         const auto& a = vowels[k % 5];
                         const auto& z = vowels[(k + 1) % 5];
                         const auto frac = (float) juce::jlimit (0.0, 1.0, inNote / ((double) noteLength / genRate));
-                        c[0].set (a.f1 + frac * frac * (z.f1 - a.f1), 0.86f, (float) genRate);
-                        c[1].set (a.f2 + frac * frac * (z.f2 - a.f2), 0.88f, (float) genRate);
-                        c[2].set (a.f3 + frac * frac * (z.f3 - a.f3), 0.9f, (float) genRate);
+                        c[0].setQ (a.f1 + frac * frac * (z.f1 - a.f1), 4.24f, (float) genRate);
+                        c[1].setQ (a.f2 + frac * frac * (z.f2 - a.f2), 4.79f, (float) genRate);
+                        c[2].setQ (a.f3 + frac * frac * (z.f3 - a.f3), 5.52f, (float) genRate);
                     }
                     const auto vibratoDepth = juce::jlimit (0.0, 1.0, (inNote - 0.2) * 3.0) * 0.25;
                     const auto vibrato = vibratoDepth * std::sin (2.0 * juce::MathConstants<double>::pi * 5.5 * i / genRate);
@@ -728,33 +729,33 @@ namespace thf::grain
                 b.clear();
                 constexpr int chords[4][5] = { { 0, 4, 7, 11, 14 }, { -3, 0, 4, 7, 11 },
                                                { -7, -3, 0, 4, 7 }, { -5, 0, 2, 7, 12 } };
-                constexpr double detune[] = { -14.0, 0.0, 13.0 };
+                constexpr double detune[] = { 0.0, -15.0, 16.0, -32.0, 31.0 };
+                constexpr float weight[] = { 1.0f, 0.8f, 0.8f, 0.55f, 0.55f };
                 const int chordLength = n / 4;
                 for (int ch = 0; ch < 2; ++ch)
                 {
                     auto* d = b.getWritePointer (ch);
                     dsp::Svf lp1, lp2;
                     dsp::SvfCoefs c;
-                    double phases[5][3];
+                    double phases[5][5];
                     for (int v = 0; v < 5; ++v)
-                        for (int k = 0; k < 3; ++k)
-                            phases[v][k] = std::fmod (0.113 * (v + 1) * (k + 2) + 0.29 * ch, 1.0);
+                        for (int k = 0; k < 5; ++k)
+                            phases[v][k] = k == 0 ? 0.1 * v : std::fmod (0.113 * (v + 1) * (k + 2) + 0.29 * ch, 1.0);
                     for (int i = 0; i < n; ++i)
                     {
                         const auto chord = juce::jmin (3, i / chordLength);
                         const auto inChord = (double) (i - chord * chordLength) / chordLength;
                         if (i % 32 == 0)
-                            c.set ((float) (1800.0 + 4200.0 * std::exp (-inChord * 3.0)), 0.2f, (float) genRate);
+                            c.setQ ((float) (3000.0 + 6000.0 * std::exp (-inChord * 3.0)), 0.78f, (float) genRate);
                         float sum = 0.0f;
                         for (int v = 0; v < 5; ++v)
-                            for (int k = 0; k < 3; ++k)
+                            for (int k = 0; k < 5; ++k)
                             {
-                                const auto cents = detune[k] * (ch == 0 ? 1.0 : -1.0) + (k == 1 ? 0.0 : 3.0 * v);
-                                const auto hz = rootHz * std::pow (2.0, chords[chord][v] / 12.0 + cents / 1200.0);
-                                sum += polyBlepSaw (phases[v][k], hz / genRate);
+                                const auto hz = rootHz * std::pow (2.0, chords[chord][v] / 12.0 + detune[k] / 1200.0);
+                                sum += weight[k] * polyBlepSaw (phases[v][k], hz / genRate);
                             }
                         const auto env = (float) (juce::jlimit (0.0, 1.0, inChord * 40.0) * (1.0 - 0.3 * inChord));
-                        d[i] = lp2.process (lp1.process (sum * 0.07f * env, c, dsp::Svf::Type::lowPass), c, dsp::Svf::Type::lowPass);
+                        d[i] = lp2.process (lp1.process (sum * 0.045f * env, c, dsp::Svf::Type::lowPass), c, dsp::Svf::Type::lowPass);
                     }
                 }
                 normalise (b, 0.7f);
@@ -796,12 +797,18 @@ namespace thf::grain
                         if (i + 23 < n) b.addSample (1, i + 23, y);   // a little width
                     }
                 }
+                // The excitation bursts are far above the ringing strings: tame them so the
+                // level is set by the notes, not by the first millisecond of each.
+                normalise (b, 1.0f);
+                for (int ch = 0; ch < 2; ++ch)
+                    for (auto* d = b.getWritePointer (ch), *end = d + n; d != end; ++d)
+                        *d = std::tanh (3.0f * *d) / std::tanh (3.0f);
                 normalise (b, 0.7f);
                 return b;
             }
 
-            // Soft electric-piano tones (FM tine + body) as a broken chord, with tremolo and a
-            // little vinyl-like crackle.
+            // Soft electric-piano tones (FM tine + body) as a broken chord, with tremolo. Clean:
+            // lo-fi grit belongs to the preset, not the source.
             juce::AudioBuffer<float> keys()
             {
                 const int n = (int) (genRate * 4.0);
@@ -828,14 +835,6 @@ namespace thf::grain
                         }
                     }
                 }
-                dsp::Random rng (9);
-                for (int i = 0; i < n; ++i)
-                    if (rng.uniform() < 0.0006f)
-                    {
-                        const auto click = rng.bipolar() * 0.08f;
-                        b.addSample (0, i, click);
-                        b.addSample (1, i, click);
-                    }
                 normalise (b, 0.7f);
                 return b;
             }

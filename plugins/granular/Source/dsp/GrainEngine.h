@@ -2,6 +2,8 @@
 
 #include "DspCore.h"
 #include "DriveStage.h"
+#include "Limiter.h"
+#include "Space.h"
 #include "SourceData.h"
 #include <atomic>
 
@@ -128,6 +130,11 @@ namespace thf::grain
         // Position + scan to a playhead in the region (0..1) for a Scan Loop mode.
         static double mapPlayhead (double position, int scanLoop) noexcept;
 
+        // Output delay of the look-ahead limiter (constant).
+        int getLatencySamples() const noexcept { return limiter.getLatencySamples(); }
+        // Seconds the reverb rings for at a Space Size.
+        static double reverbTailSeconds (float spaceSize) noexcept { return dsp::SpaceReverb::decaySeconds (spaceSize); }
+
         // Renders and ADDS nothing: overwrites left/right with n samples.
         void render (float* left, float* right, int n, const EngineParams&);
 
@@ -224,9 +231,11 @@ namespace thf::grain
         dsp::AdsrCoefs adsrCoefs;
         dsp::SvfCoefs svfCoefs[maxVoices];
         dsp::DriveStage drive;
-        juce::Reverb reverb;
-        juce::Reverb::Parameters reverbParams;
-        int reverbTail = 0;          // samples to keep running the reverb after Space goes to 0
+        dsp::SpaceReverb reverb;
+        bool reverbRunning = false;  // keeps running after Space goes to 0 until the tail is gone
+        dsp::Limiter limiter;
+        dsp::Svf sideHighPass[2];    // low end in mono: 4th-order high-pass on the side at 200 Hz
+        dsp::SvfCoefs sideCoefs[2];
         float levelSmoothed = 1.0f;
         float fadeGain = 1.0f;
         std::atomic<float> fadeTarget { 1.0f };
