@@ -1,0 +1,207 @@
+#pragma once
+
+#include "../PluginProcessor.h"
+#include <ui/ThifoLookAndFeel.h>
+#include <ui/Palette.h>
+
+namespace thf::grain
+{
+    // Shared context for the controls: the processor plus a callback that reports which
+    // parameter the user is pointing at (for the status line).
+    struct UiContext
+    {
+        GrainProcessor& processor;
+        ThifoLookAndFeel& lookAndFeel;
+        std::function<void (const juce::String& paramId)> onFocus;
+        std::function<bool()> isLearnMode;
+    };
+
+    // Right-click menu shared by knobs and faders: learn / forget CC, default value.
+    void showParameterMenu (UiContext&, juce::Component& target, const juce::String& paramId);
+
+    // Slider that reports focus, opens the parameter menu on right-click and, in learn mode,
+    // arms MIDI learn instead of moving.
+    class ParamSlider : public juce::Slider
+    {
+    public:
+        ParamSlider (UiContext& c) : ctx (c) {}
+        juce::String paramId;
+
+        void mouseEnter (const juce::MouseEvent& e) override
+        {
+            if (ctx.onFocus) ctx.onFocus (paramId);
+            Slider::mouseEnter (e);
+        }
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            if (ctx.onFocus) ctx.onFocus (paramId);
+            if (e.mods.isPopupMenu()) { showParameterMenu (ctx, *this, paramId); return; }
+            if (ctx.isLearnMode && ctx.isLearnMode()) { ctx.processor.startLearn (paramId); return; }
+            ctx.processor.getUndoManager().beginNewTransaction();
+            Slider::mouseDown (e);
+        }
+        void mouseDrag (const juce::MouseEvent& e) override
+        {
+            if (e.mods.isPopupMenu() || (ctx.isLearnMode && ctx.isLearnMode())) return;
+            Slider::mouseDrag (e);
+        }
+        void mouseUp (const juce::MouseEvent& e) override
+        {
+            if (e.mods.isPopupMenu() || (ctx.isLearnMode && ctx.isLearnMode())) return;
+            Slider::mouseUp (e);
+        }
+
+    private:
+        UiContext& ctx;
+    };
+
+    //==============================================================================
+    // Encoder slot: slot number, knob, parameter name, value. Re-attachable (pages).
+    class ControlKnob : public juce::Component
+    {
+    public:
+        ControlKnob (UiContext&, int slotNumber, float knobSize);
+
+        void attach (const juce::String& paramId, juce::Colour arc);
+        void setCompact (bool c) { compact = c; resized(); }
+        const juce::String& getParamId() const noexcept { return paramId; }
+        void refresh();
+
+        void resized() override;
+        void paint (juce::Graphics&) override;
+
+        ParamSlider slider;
+
+    private:
+        UiContext& ctx;
+        int slot;
+        float knobSize;
+        bool compact = false;
+        juce::String paramId;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
+        juce::Label name, value;
+    };
+
+    //==============================================================================
+    class ControlFader : public juce::Component
+    {
+    public:
+        ControlFader (UiContext&, int slotNumber, const juce::String& paramId, juce::Colour capColour);
+        void refresh();
+        void resized() override;
+        void paint (juce::Graphics&) override;
+        ParamSlider slider;
+
+    private:
+        UiContext& ctx;
+        int slot;
+        juce::String paramId;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
+        juce::Label name, value;
+    };
+
+    //==============================================================================
+    class PadButton : public juce::Component
+    {
+    public:
+        PadButton (juce::Colour pastel);
+        void setLabel (const juce::String& l)     { if (label != l) { label = l; repaint(); } }
+        void setLit (bool lit);
+        void setSubLabel (const juce::String& s)  { if (sub != s) { sub = s; repaint(); } }
+        void flash();
+        void setColour (juce::Colour c)           { pastel = c; repaint(); }
+
+        std::function<void (const juce::ModifierKeys&)> onClick;
+
+        void paint (juce::Graphics&) override;
+        void mouseDown (const juce::MouseEvent&) override;
+        void mouseUp (const juce::MouseEvent&) override;
+
+    private:
+        juce::Colour pastel;
+        juce::String label, sub;
+        bool lit = false, down = false;
+        juce::uint32 flashTime = 0;
+    };
+
+    //==============================================================================
+    // Mirror of a hardware touch strip. Pitch springs back to the centre.
+    class StripView : public juce::Component
+    {
+    public:
+        StripView (bool isPitch);
+        void setValue (float v) { if (std::abs (v - value) > 1.0e-3f) { value = v; repaint(); } }
+        void paint (juce::Graphics&) override;
+        std::function<void (float)> onUserChange;
+        void mouseDown (const juce::MouseEvent&) override;
+        void mouseDrag (const juce::MouseEvent&) override;
+        void mouseUp (const juce::MouseEvent&) override;
+
+    private:
+        bool pitch;
+        float value;
+    };
+
+    //==============================================================================
+    class MeterView : public juce::Component
+    {
+    public:
+        void push (float left, float right);
+        void paint (juce::Graphics&) override;
+    private:
+        float levelL = 0, levelR = 0, holdL = 0, holdR = 0;
+        int holdCount = 0;
+    };
+
+    //==============================================================================
+    // Small glass screen above the main encoder: page and the focused parameter.
+    class DisplayScreen : public juce::Component
+    {
+    public:
+        explicit DisplayScreen (ThifoLookAndFeel& l) : lookAndFeel (l) {}
+        void setPage (const juce::String& name, int index, int count);
+        void setStatus (const juce::String& param, const juce::String& value, const juce::String& cc);
+        void paint (juce::Graphics&) override;
+        std::function<void()> onPageClick;
+        void mouseDown (const juce::MouseEvent&) override { if (onPageClick) onPageClick(); }
+
+    private:
+        ThifoLookAndFeel& lookAndFeel;
+        juce::String page, statusParam, statusValue, statusCc;
+        int pageIndex = 0, pageCount = 1;
+    };
+
+    //==============================================================================
+    // Overlay with the parameters that have no hardware slot (mouse only).
+    class SettingsPanel : public juce::Component
+    {
+    public:
+        explicit SettingsPanel (UiContext&);
+        void resized() override;
+        void paint (juce::Graphics&) override;
+        void refreshTexts();
+
+    private:
+        UiContext& ctx;
+        struct Choice
+        {
+            juce::String paramId;
+            juce::Label label;
+            juce::ComboBox box;
+            std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> attachment;
+        };
+        std::vector<std::unique_ptr<ControlKnob>> knobs;
+        std::vector<std::unique_ptr<Choice>> choices;
+    };
+
+    //==============================================================================
+    class HelpPanel : public juce::Component
+    {
+    public:
+        explicit HelpPanel (ThifoLookAndFeel& l) : lookAndFeel (l) {}
+        void paint (juce::Graphics&) override;
+        void mouseDown (const juce::MouseEvent&) override { setVisible (false); }
+    private:
+        ThifoLookAndFeel& lookAndFeel;
+    };
+}
