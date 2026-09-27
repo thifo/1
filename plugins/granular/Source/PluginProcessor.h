@@ -20,8 +20,9 @@ namespace thf::grain
         void waitUntilReady() const;
 
     private:
-        std::array<SourceData::Ptr, 6> owned;
-        std::array<std::atomic<const SourceData*>, 6> published {};
+        static constexpr int count = 10;   // = sourceChoices.size()
+        std::array<SourceData::Ptr, count> owned;
+        std::array<std::atomic<const SourceData*>, count> published {};
         std::thread worker;
     };
 

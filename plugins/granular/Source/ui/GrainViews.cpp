@@ -451,8 +451,8 @@ namespace thf::grain
     //==============================================================================
     SettingsPanel::SettingsPanel (UiContext& c) : ctx (c)
     {
-        const char* knobIds[] = { pid::root, pid::fine, pid::chaos, pid::voices, pid::glide, pid::bendRange,
-                                  pid::velocity, pid::filterDecay, pid::modDepth };
+        const char* knobIds[] = { pid::root, pid::fine, pid::chaos, pid::window, pid::voices, pid::glide,
+                                  pid::bendRange, pid::velocity, pid::filterDecay, pid::modDepth, pid::spaceSize };
         for (auto* id : knobIds)
         {
             auto k = std::make_unique<ControlKnob> (ctx, 0, 46.0f);
@@ -462,8 +462,8 @@ namespace thf::grain
             knobs.push_back (std::move (k));
         }
 
-        const char* choiceIds[] = { pid::source, pid::scanMode, pid::syncRate, pid::voiceMode, pid::filterType,
-                                    pid::lfoShape, pid::lfoTarget, pid::modTarget };
+        const char* choiceIds[] = { pid::source, pid::quantize, pid::scanMode, pid::syncRate, pid::voiceMode, pid::filterType,
+                                    pid::lfoShape, pid::lfoTarget, pid::lfoMode, pid::lfoDivision, pid::modTarget };
         for (auto* id : choiceIds)
         {
             auto ch = std::make_unique<Choice>();
@@ -499,7 +499,7 @@ namespace thf::grain
             k->setBounds (knobRow.removeFromLeft (knobW).reduced (4, 0));
 
         r.removeFromTop (12);
-        const int perRow = 4;
+        const int perRow = 6;
         const auto cellW = r.getWidth() / perRow;
         for (size_t i = 0; i < choices.size(); ++i)
         {

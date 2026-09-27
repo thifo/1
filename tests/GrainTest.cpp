@@ -103,7 +103,7 @@ namespace
 
     void waitForFactory (GrainProcessor& p)
     {
-        for (int i = 0; i < 2000 && p.getFactorySource (5) == nullptr; ++i)
+        for (int i = 0; i < 4000 && p.getFactorySource (sourceChoices.size() - 1) == nullptr; ++i)
             juce::Thread::sleep (5);
     }
 
@@ -300,6 +300,42 @@ public:
             expectLessOrEqual (worst, 1.0f);
         }
 
+        beginTest ("Pitch quantize snaps random offsets to the chosen intervals");
+        {
+            expectEquals (GrainEngine::quantizeInterval (5.0f, 0), 5.0f);
+            expectEquals (GrainEngine::quantizeInterval (5.0f, 1), 0.0f);
+            expectEquals (GrainEngine::quantizeInterval (7.0f, 1), 12.0f);
+            expectEquals (GrainEngine::quantizeInterval (-8.0f, 1), -12.0f);
+            expectEquals (GrainEngine::quantizeInterval (8.0f, 2), 7.0f);
+            expectEquals (GrainEngine::quantizeInterval (-4.0f, 2), -5.0f);
+            expectEquals (GrainEngine::quantizeInterval (3.4f, 3), 4.0f);
+            expectEquals (GrainEngine::quantizeInterval (3.4f, 4), 3.0f);
+            expectEquals (GrainEngine::quantizeInterval (-1.4f, 3), -1.0f);
+        }
+
+        beginTest ("LFO on Level ducks the output (pump)");
+        {
+            auto src = noiseSource (4.0);
+            auto run = [&src] (float depth)
+            {
+                GrainEngine e;
+                e.prepare (rate);
+                e.setSource (src.get());
+                auto p = plain();
+                p.spray = 1.0f; p.chaos = 1.0f; p.density = 80.0f;
+                p.lfoTarget = 6; p.lfoShape = 3; p.lfoRate = 4.0f; p.lfoDepth = depth;
+                e.noteOn (60, 1.0f, p);
+                return render (e, p, (int) rate * 2);
+            };
+            const auto dry = run (0.0f), pumped = run (1.0f);
+            // Square LFO at full depth: half of every cycle is silent.
+            expectLessThan (rms (pumped, 4800) / rms (dry, 4800), 0.8);
+            float quietest = 1.0f;
+            for (size_t i = 4800; i + 480 < pumped.size(); i += 480)
+                quietest = std::min (quietest, (float) rms (std::vector<float> (pumped.begin() + (long) i, pumped.begin() + (long) i + 480)));
+            expectLessThan (quietest, 1.0e-3f);
+        }
+
         beginTest ("No source: silence, no crash");
         {
             GrainEngine e;
@@ -395,6 +431,11 @@ public:
                 midi.addEvent (juce::MidiMessage::controllerEvent (1, 1, 90), 70);
                 midi.addEvent (juce::MidiMessage::noteOff (1, 60), 400);
             };
+            p.param (pid::space)->setValueNotifyingHost (0.5f);        // reverb running
+            p.param (pid::quantize)->setValueNotifyingHost (1.0f);     // minor
+            p.param (pid::lfoTarget)->setValueNotifyingHost (1.0f);    // Level
+            p.param (pid::lfoDepth)->setValueNotifyingHost (0.8f);
+            p.param (pid::jitter)->setValueNotifyingHost (0.5f);
             for (int i = 0; i < 4; ++i) { fill(); buffer.clear(); p.processBlock (buffer, midi); }
 
             fill();

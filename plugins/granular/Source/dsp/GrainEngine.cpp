@@ -27,7 +27,36 @@ namespace thf::grain
     void GrainEngine::prepare (double sr)
     {
         sampleRate = sr > 0.0 ? sr : 48000.0;
+        reverb.setSampleRate (sampleRate);
         reset();
+    }
+
+    float GrainEngine::quantizeInterval (float semitones, int mode) noexcept
+    {
+        static constexpr int octaves[] = { 0 };
+        static constexpr int fifths[]  = { 0, 7 };
+        static constexpr int major[]   = { 0, 2, 4, 5, 7, 9, 11 };
+        static constexpr int minor[]   = { 0, 2, 3, 5, 7, 8, 10 };
+        const int* set = nullptr;
+        int count = 0;
+        switch (mode)
+        {
+            case 1: set = octaves; count = 1; break;
+            case 2: set = fifths;  count = 2; break;
+            case 3: set = major;   count = 7; break;
+            case 4: set = minor;   count = 7; break;
+            default: return semitones;
+        }
+        const auto octave = (int) std::floor (semitones / 12.0f);
+        float best = 0.0f, bestDistance = 1.0e9f;
+        for (int o = octave - 1; o <= octave + 1; ++o)
+            for (int i = 0; i < count; ++i)
+            {
+                const auto candidate = (float) (12 * o + set[i]);
+                const auto d = std::abs (candidate - semitones);
+                if (d < bestDistance) { bestDistance = d; best = candidate; }
+            }
+        return best;
     }
 
     void GrainEngine::reset()
@@ -41,6 +70,9 @@ namespace thf::grain
         for (auto& g : grains)
             g.active = false;
         drive.reset();
+        reverb.reset();
+        reverbTail = 0;
+        levelSmoothed = 1.0f;
         globalScan = 0.0;
         monoCount = 0;
         noteCounter = 0;
@@ -357,7 +389,7 @@ namespace thf::grain
 
         const auto length0 = (double) source->getLength();
         const auto semis = (v.currentNote - (float) p.root) + p.pitch + bend * p.bendRange
-                         + modulation.pitch + p.jitter * rJitter;
+                         + modulation.pitch + quantizeInterval (p.jitter * rJitter, p.quantize);
         const auto ratio = juce::jlimit (1.0 / 64.0, 32.0,
                                          std::exp2 ((double) semis / 12.0) * source->getSampleRate() / sampleRate);
         const auto span0 = (double) sizeSamples * ratio;
@@ -404,7 +436,8 @@ namespace thf::grain
         const auto sr = (float) sampleRate;
         adsrCoefs.set (sr, p.attackMs, p.decayMs, p.sustain, p.releaseMs);
 
-        lfoValue = lfo.advance (n, p.lfoRate, sr, (dsp::Lfo::Shape) p.lfoShape, rng);
+        const auto lfoRate = p.lfoSync ? (float) (p.bpm / 60.0 / juce::jmax (1.0e-3, p.lfoBeats)) : p.lfoRate;
+        lfoValue = lfo.advance (n, lfoRate, sr, (dsp::Lfo::Shape) p.lfoShape, rng);
         modulation = {};
         auto apply = [this] (int target, float amount)
         {
@@ -421,6 +454,13 @@ namespace thf::grain
         };
         apply (p.lfoTarget, lfoValue * p.lfoDepth);
         apply (p.modTarget, modWheel * p.modDepth);
+
+        // Level: the LFO ducks from full level (LFO at +1) down by its depth (LFO at -1):
+        // a rising saw gives the classic pump on every cycle. The mod strip just turns down.
+        if (p.lfoTarget == 6)
+            modulation.level *= 1.0f - p.lfoDepth * 0.5f * (1.0f - lfoValue);
+        if (p.modTarget == 6)
+            modulation.level *= 1.0f - modWheel * p.modDepth;
 
         const auto smooth20ms = 1.0f - std::exp (-(float) n / (0.02f * sr));
         const auto smooth5ms = 1.0f - std::exp (-(float) n / (0.005f * sr));
@@ -609,6 +649,39 @@ namespace thf::grain
             else
             {
                 drive.reset();
+            }
+
+            // Space: plate-like reverb after the drive. Dry stays at unity so switching the
+            // reverb in and out is seamless; it keeps running while its tail rings out.
+            if (p.space > 1.0e-3f)
+                reverbTail = (int) (6.0 * sampleRate);
+            if (reverbTail > 0)
+            {
+                juce::Reverb::Parameters rp;
+                rp.roomSize = 0.55f + 0.44f * p.spaceSize;
+                rp.damping = 0.45f;
+                rp.wetLevel = p.space * 0.36f;
+                rp.dryLevel = 0.5f;          // x2 inside juce::Reverb = unity
+                rp.width = 1.0f;
+                rp.freezeMode = 0.0f;
+                if (std::abs (rp.roomSize - reverbParams.roomSize) > 1.0e-4f || std::abs (rp.wetLevel - reverbParams.wetLevel) > 1.0e-4f)
+                {
+                    reverb.setParameters (rp);
+                    reverbParams = rp;
+                }
+                reverb.processStereo (L, R, len);
+                reverbTail -= len;
+            }
+
+            // Level modulation (pump) and output gain, both ramped across the block.
+            const auto startLevel = levelSmoothed;
+            levelSmoothed += (modulation.level - levelSmoothed) * (1.0f - std::exp (-(float) len / (0.002f * (float) sampleRate)));
+            const auto levelStep = (levelSmoothed - startLevel) / (float) len;
+            for (int i = 0; i < len; ++i)
+            {
+                const auto lv = startLevel + levelStep * (float) (i + 1);
+                L[i] *= lv;
+                R[i] *= lv;
             }
 
             // Output gain ramps linearly across the control block. The fixed -6 dB leaves room

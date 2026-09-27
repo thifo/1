@@ -404,6 +404,9 @@ namespace thf::grain::dsp
 
         void reset (Random& rng) noexcept { phase = 0.0; held = rng.bipolar(); }
 
+        // Tempo sync: puts the phase where the host transport says it is.
+        void setPhase (double p) noexcept { phase = p - std::floor (p); }
+
         float advance (int samples, float rateHz, float sampleRate, Shape shape, Random& rng) noexcept
         {
             phase += (double) rateHz * samples / sampleRate;

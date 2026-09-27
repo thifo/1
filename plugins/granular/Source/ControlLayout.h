@@ -29,7 +29,7 @@ namespace thf::grain::layout
         { pid::scan,   pid::spray,     pid::size,      pid::density,
           pid::pitch,  pid::jitter,    pid::stereo,    pid::reverse },
         { pid::cutoff, pid::resonance, pid::filterEnv, pid::drive,
-          pid::lfoRate,pid::lfoDepth,  pid::window,    pid::output },
+          pid::lfoRate,pid::lfoDepth,  pid::space,     pid::output },
     }};
 
     // Faders never change with the page: they are absolute, and paging them would make

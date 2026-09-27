@@ -98,6 +98,7 @@ namespace thf::grain
                                 [] (float v) { return juce::String (v, 2) + " st"; }));
         layout.add (percentParam (pid::reverse, "Reverse", 0.0f));
         layout.add (percentParam (pid::stereo, "Stereo", 0.5f));
+        layout.add (choiceParam (pid::quantize, "Pitch Quantize", quantizeChoices, 0));
 
         // Voices
         layout.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID (pid::voices, version), "Voices", 1, 16, 8));
@@ -127,6 +128,12 @@ namespace thf::grain
         layout.add (choiceParam (pid::lfoTarget, "LFO Target", modTargetChoices, 0));
         layout.add (choiceParam (pid::modTarget, "Mod Target", modTargetChoices, 1));
         layout.add (percentParam (pid::modDepth, "Mod Depth", 0.5f));
+        layout.add (choiceParam (pid::lfoMode, "LFO Mode", lfoModeChoices, 0));
+        layout.add (choiceParam (pid::lfoDivision, "LFO Division", lfoDivisionChoices, 4));
+
+        // Space
+        layout.add (percentParam (pid::space, "Space", 0.0f));
+        layout.add (percentParam (pid::spaceSize, "Space Size", 0.6f));
 
         // Output
         layout.add (floatParam (pid::output, "Output", Range (-36.0f, 12.0f, 0.0f, 1.8f), 0.0f,

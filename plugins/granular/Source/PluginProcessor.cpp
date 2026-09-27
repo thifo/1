@@ -6,6 +6,7 @@ namespace thf::grain
     //==============================================================================
     FactorySources::FactorySources()
     {
+        jassert (count == sourceChoices.size());
         for (auto& p : published)
             p.store (nullptr);
         worker = std::thread ([this]
@@ -49,6 +50,8 @@ namespace thf::grain
             sync = get (pid::sync); syncRate = get (pid::syncRate); chaos = get (pid::chaos);
             window = get (pid::window); pitch = get (pid::pitch); fine = get (pid::fine);
             jitter = get (pid::jitter); reverse = get (pid::reverse); stereo = get (pid::stereo);
+            quantize = get (pid::quantize); lfoMode = get (pid::lfoMode); lfoDivision = get (pid::lfoDivision);
+            space = get (pid::space); spaceSize = get (pid::spaceSize);
             voices = get (pid::voices); voiceMode = get (pid::voiceMode); glide = get (pid::glide);
             hold = get (pid::hold); bendRange = get (pid::bendRange); velocity = get (pid::velocity);
             attack = get (pid::attack); decay = get (pid::decay); sustain = get (pid::sustain);
@@ -64,7 +67,8 @@ namespace thf::grain
             *sync, *syncRate, *chaos, *window, *pitch, *fine, *jitter, *reverse, *stereo, *voices,
             *voiceMode, *glide, *hold, *bendRange, *velocity, *attack, *decay, *sustain, *release,
             *filterType, *cutoff, *resonance, *filterEnv, *filterDecay, *drive, *lfoRate, *lfoDepth,
-            *lfoShape, *lfoTarget, *modTarget, *modDepth, *output, *safeClip, *hq;
+            *lfoShape, *lfoTarget, *modTarget, *modDepth, *output, *safeClip, *hq,
+            *quantize, *lfoMode, *lfoDivision, *space, *spaceSize;
     };
 
     //==============================================================================
@@ -145,6 +149,11 @@ namespace thf::grain
         p.jitter = r.jitter->load();
         p.reverse = r.reverse->load();
         p.stereo = r.stereo->load();
+        p.quantize = (int) r.quantize->load();
+        p.lfoSync = r.lfoMode->load() > 0.5f;
+        p.lfoBeats = lfoDivisionBeats[juce::jlimit (0, (int) std::size (lfoDivisionBeats) - 1, (int) r.lfoDivision->load())];
+        p.space = r.space->load();
+        p.spaceSize = r.spaceSize->load();
         p.root = (int) r.root->load();
         p.voices = (int) r.voices->load();
         p.voiceMode = (int) r.voiceMode->load();
@@ -192,8 +201,14 @@ namespace thf::grain
         auto engineParams = makeEngineParams();
         if (auto* ph = getPlayHead())
             if (auto pos = ph->getPosition())
+            {
                 if (auto bpm = pos->getBpm())
                     engineParams.bpm = *bpm;
+                // A synced LFO follows the song position while the transport runs.
+                if (engineParams.lfoSync && pos->getIsPlaying())
+                    if (auto ppq = pos->getPpqPosition())
+                        engine.syncLfo (*ppq, engineParams.lfoBeats);
+            }
         engine.setHold (raw->hold->load() > 0.5f);
         if (scanResetRequested.exchange (false))
             engine.resetScan();

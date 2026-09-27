@@ -26,6 +26,7 @@ namespace thf::grain
         float jitter = 0.0f;        // +/- semitones of random pitch per grain
         float reverse = 0.0f;       // probability of a reversed grain
         float stereo = 0.5f;        // random pan width
+        int quantize = 0;           // pitch jitter snapping: off, octaves, fifths, major, minor
         int root = 60;
 
         int voices = 8;
@@ -46,6 +47,11 @@ namespace thf::grain
         int lfoShape = 0, lfoTarget = 0;
         int modTarget = 1;
         float modDepth = 0.5f;
+        bool lfoSync = false;
+        double lfoBeats = 1.0;      // beats per cycle when synced
+
+        float space = 0.0f;         // reverb amount
+        float spaceSize = 0.6f;
 
         float outputGain = 1.0f;
         bool safeClip = true;
@@ -88,6 +94,11 @@ namespace thf::grain
         void setPitchBend (float bipolar) noexcept  { bend = bipolar; }
         void setModWheel (float unipolar) noexcept  { modWheel = unipolar; }
         void resetScan() noexcept;
+        // Called once per host block when the LFO follows the transport.
+        void syncLfo (double ppqPosition, double beatsPerCycle) noexcept { lfo.setPhase (ppqPosition / beatsPerCycle); }
+
+        // Nearest allowed interval for a random pitch offset (semitones).
+        static float quantizeInterval (float semitones, int mode) noexcept;
 
         // Renders and ADDS nothing: overwrites left/right with n samples.
         void render (float* left, float* right, int n, const EngineParams&);
@@ -136,7 +147,7 @@ namespace thf::grain
 
         struct Modulation
         {
-            float position = 0, spray = 0, sizeMul = 1, densityMul = 1, pitch = 0, cutoffMul = 1;
+            float position = 0, spray = 0, sizeMul = 1, densityMul = 1, pitch = 0, cutoffMul = 1, level = 1;
         };
 
         void startVoice (Voice&, int note, float velocityGain, bool keyDown, const EngineParams&);
@@ -158,6 +169,10 @@ namespace thf::grain
         dsp::AdsrCoefs adsrCoefs;
         dsp::SvfCoefs svfCoefs[maxVoices];
         dsp::Drive drive;
+        juce::Reverb reverb;
+        juce::Reverb::Parameters reverbParams;
+        int reverbTail = 0;          // samples to keep running the reverb after Space goes to 0
+        float levelSmoothed = 1.0f;
 
         std::array<Voice, maxVoices> voices {};
         std::array<Grain, maxGrains> grains {};

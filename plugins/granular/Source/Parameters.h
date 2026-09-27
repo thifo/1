@@ -27,6 +27,7 @@ namespace thf::grain
         inline constexpr const char* jitter     = "jitter";
         inline constexpr const char* reverse    = "reverse";
         inline constexpr const char* stereo     = "stereo";
+        inline constexpr const char* quantize   = "quantize";
 
         // Voices
         inline constexpr const char* voices     = "voices";
@@ -55,6 +56,12 @@ namespace thf::grain
         inline constexpr const char* lfoTarget  = "lfoTarget";
         inline constexpr const char* modTarget  = "modTarget";
         inline constexpr const char* modDepth   = "modDepth";
+        inline constexpr const char* lfoMode    = "lfoMode";
+        inline constexpr const char* lfoDivision= "lfoDivision";
+
+        // Space (reverb)
+        inline constexpr const char* space      = "space";
+        inline constexpr const char* spaceSize  = "spaceSize";
 
         // Output
         inline constexpr const char* output     = "output";
@@ -63,16 +70,24 @@ namespace thf::grain
     }
 
     // Choice lists (order is part of the saved state: append only).
-    inline const juce::StringArray sourceChoices   { "Sample", "Saw Pad", "Voice", "Bell", "Noise", "Glass" };
+    inline const juce::StringArray sourceChoices   { "Sample", "Saw Pad", "Voice", "Bell", "Noise", "Glass",
+                                                     "Vocal Phrase", "Chord Stack", "Pluck", "Keys" };
     inline const juce::StringArray scanModeChoices { "Global", "Per Note" };
     inline const juce::StringArray syncRateChoices { "1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/64" };
     inline const juce::StringArray voiceModeChoices{ "Poly", "Mono", "Legato" };
     inline const juce::StringArray filterChoices   { "Low Pass", "Band Pass", "High Pass" };
     inline const juce::StringArray lfoShapeChoices { "Sine", "Triangle", "Saw", "Square", "Random" };
-    inline const juce::StringArray modTargetChoices{ "Position", "Spray", "Size", "Density", "Pitch", "Cutoff" };
+    inline const juce::StringArray modTargetChoices{ "Position", "Spray", "Size", "Density", "Pitch", "Cutoff", "Level" };
+    inline const juce::StringArray quantizeChoices { "Off", "Octaves", "Fifths", "Major", "Minor" };
+    inline const juce::StringArray lfoModeChoices  { "Free", "Sync" };
+    inline const juce::StringArray lfoDivisionChoices { "4 bars", "2 bars", "1 bar", "1/2", "1/4", "1/8", "1/16",
+                                                        "1/4T", "1/8T", "1/4D" };
 
     // Beats per grain for each syncRate choice.
     inline constexpr double syncRateBeats[] = { 1.0, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125, 0.0625 };
+
+    // Beats per LFO cycle for each lfoDivision choice.
+    inline constexpr double lfoDivisionBeats[] = { 16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.25, 2.0 / 3.0, 1.0 / 3.0, 1.5 };
 
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 

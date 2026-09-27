@@ -339,6 +339,174 @@ namespace thf::grain
                 normalise (b, 0.7f);
                 return b;
             }
+
+            // A sung phrase: pitched vowels gliding through a minor-pentatonic line, so
+            // scanning or spraying across it gives pitched vocal chops.
+            juce::AudioBuffer<float> vocalPhrase()
+            {
+                constexpr double seconds = 6.0;
+                const int n = (int) (genRate * seconds);
+                juce::AudioBuffer<float> b (1, n);
+                struct Vowel { float f1, f2, f3; };
+                constexpr Vowel vowels[] = { { 730, 1090, 2440 }, { 570, 840, 2410 }, { 530, 1840, 2480 },
+                                             { 300, 870, 2240 }, { 270, 2290, 3010 } };
+                constexpr int melody[] = { 0, 3, 7, 5, 10, 7, 12, 3 };
+                constexpr int notes = (int) std::size (melody);
+                const auto noteLength = n / notes;
+                dsp::Svf f[3];
+                dsp::SvfCoefs c[3];
+                dsp::Random rng (77);
+                double phase = 0.0, currentSemis = melody[0];
+                auto* d = b.getWritePointer (0);
+                for (int i = 0; i < n; ++i)
+                {
+                    const auto k = juce::jmin (notes - 1, i / noteLength);
+                    const auto inNote = (double) (i - k * noteLength) / genRate;
+                    currentSemis += (melody[k] - currentSemis) * (1.0 - std::exp (-1.0 / (0.03 * genRate)));   // portamento
+                    if (i % 32 == 0)
+                    {
+                        const auto& a = vowels[k % 5];
+                        const auto& z = vowels[(k + 1) % 5];
+                        const auto frac = (float) juce::jlimit (0.0, 1.0, inNote / ((double) noteLength / genRate));
+                        c[0].set (a.f1 + frac * frac * (z.f1 - a.f1), 0.86f, (float) genRate);
+                        c[1].set (a.f2 + frac * frac * (z.f2 - a.f2), 0.88f, (float) genRate);
+                        c[2].set (a.f3 + frac * frac * (z.f3 - a.f3), 0.9f, (float) genRate);
+                    }
+                    const auto vibratoDepth = juce::jlimit (0.0, 1.0, (inNote - 0.2) * 3.0) * 0.25;
+                    const auto vibrato = vibratoDepth * std::sin (2.0 * juce::MathConstants<double>::pi * 5.5 * i / genRate);
+                    const auto hz = rootHz * std::pow (2.0, (currentSemis + vibrato) / 12.0);
+                    const auto glottal = polyBlepSaw (phase, hz / genRate);
+                    const auto breath = rng.bipolar() * 0.08f;
+                    const auto src = glottal + breath;
+                    const auto env = (float) (juce::jlimit (0.0, 1.0, inNote / 0.04)
+                                              * (0.75 + 0.25 * std::cos (juce::MathConstants<double>::pi * inNote / ((double) noteLength / genRate))));
+                    d[i] = env * (f[0].process (src, c[0], dsp::Svf::Type::bandPass)
+                                  + 0.55f * f[1].process (src, c[1], dsp::Svf::Type::bandPass)
+                                  + 0.3f * f[2].process (src, c[2], dsp::Svf::Type::bandPass));
+                }
+                normalise (b, 0.7f);
+                return b;
+            }
+
+            // Wide detuned-saw chords, one per second: I maj9, vi m9, IV maj9, V sus.
+            juce::AudioBuffer<float> chordStack()
+            {
+                const int n = (int) (genRate * 4.0);
+                juce::AudioBuffer<float> b (2, n);
+                b.clear();
+                constexpr int chords[4][5] = { { 0, 4, 7, 11, 14 }, { -3, 0, 4, 7, 11 },
+                                               { -7, -3, 0, 4, 7 }, { -5, 0, 2, 7, 12 } };
+                constexpr double detune[] = { -14.0, 0.0, 13.0 };
+                const int chordLength = n / 4;
+                for (int ch = 0; ch < 2; ++ch)
+                {
+                    auto* d = b.getWritePointer (ch);
+                    dsp::Svf lp1, lp2;
+                    dsp::SvfCoefs c;
+                    double phases[5][3];
+                    for (int v = 0; v < 5; ++v)
+                        for (int k = 0; k < 3; ++k)
+                            phases[v][k] = std::fmod (0.113 * (v + 1) * (k + 2) + 0.29 * ch, 1.0);
+                    for (int i = 0; i < n; ++i)
+                    {
+                        const auto chord = juce::jmin (3, i / chordLength);
+                        const auto inChord = (double) (i - chord * chordLength) / chordLength;
+                        if (i % 32 == 0)
+                            c.set ((float) (1800.0 + 4200.0 * std::exp (-inChord * 3.0)), 0.2f, (float) genRate);
+                        float sum = 0.0f;
+                        for (int v = 0; v < 5; ++v)
+                            for (int k = 0; k < 3; ++k)
+                            {
+                                const auto cents = detune[k] * (ch == 0 ? 1.0 : -1.0) + (k == 1 ? 0.0 : 3.0 * v);
+                                const auto hz = rootHz * std::pow (2.0, chords[chord][v] / 12.0 + cents / 1200.0);
+                                sum += polyBlepSaw (phases[v][k], hz / genRate);
+                            }
+                        const auto env = (float) (juce::jlimit (0.0, 1.0, inChord * 40.0) * (1.0 - 0.3 * inChord));
+                        d[i] = lp2.process (lp1.process (sum * 0.07f * env, c, dsp::Svf::Type::lowPass), c, dsp::Svf::Type::lowPass);
+                    }
+                }
+                normalise (b, 0.7f);
+                return b;
+            }
+
+            // Plucked strings (Karplus-Strong) playing a pentatonic line, 0.5 s per note.
+            juce::AudioBuffer<float> pluck()
+            {
+                const int n = (int) (genRate * 4.0);
+                juce::AudioBuffer<float> b (2, n);
+                b.clear();
+                constexpr int line[] = { 0, 2, 4, 7, 9, 12, 7, 4 };
+                constexpr int mask = 4095;
+                const int noteLength = n / 8;
+                dsp::Random rng (5);
+                std::vector<float> ring (mask + 1);
+                for (int note = 0; note < 8; ++note)
+                {
+                    const auto period = genRate / (rootHz * std::pow (2.0, line[note] / 12.0));
+                    const auto delay = period - 0.5;   // the two-point average adds half a sample
+                    std::fill (ring.begin(), ring.end(), 0.0f);
+                    const int start = note * noteLength;
+                    const int end = juce::jmin (n, start + (int) (2.0 * genRate));
+                    for (int i = start, w = 0; i < end; ++i, w = (w + 1) & mask)
+                    {
+                        auto at = [&] (double back)
+                        {
+                            const auto pos = (double) w - back;
+                            const auto i0 = (int) std::floor (pos);
+                            const auto f = (float) (pos - i0);
+                            const auto x0 = ring[(size_t) (i0 & mask)], x1 = ring[(size_t) ((i0 + 1) & mask)];
+                            return x0 + f * (x1 - x0);
+                        };
+                        const auto excite = (i - start) < (int) period ? rng.bipolar() : 0.0f;
+                        const auto y = excite + 0.996f * 0.5f * (at (delay) + at (delay + 1.0));
+                        ring[(size_t) w] = y;
+                        b.addSample (0, i, y);
+                        if (i + 23 < n) b.addSample (1, i + 23, y);   // a little width
+                    }
+                }
+                normalise (b, 0.7f);
+                return b;
+            }
+
+            // Soft electric-piano tones (FM tine + body) as a broken chord, with tremolo and a
+            // little vinyl-like crackle.
+            juce::AudioBuffer<float> keys()
+            {
+                const int n = (int) (genRate * 4.0);
+                juce::AudioBuffer<float> b (2, n);
+                b.clear();
+                constexpr int line[] = { 0, 4, 7, 11, 12, 7, 4, 2 };
+                const int noteLength = n / 8;
+                for (int note = 0; note < 8; ++note)
+                {
+                    const auto hz = rootHz * std::pow (2.0, line[note] / 12.0);
+                    const int start = note * noteLength;
+                    for (int i = start; i < n; ++i)
+                    {
+                        const auto t = (i - start) / genRate;
+                        if (t > 2.5) break;
+                        const auto w = 2.0 * juce::MathConstants<double>::pi * hz * t;
+                        const auto tine = std::exp (-t * 9.0) * 1.2;
+                        const auto body = std::exp (-t * 1.4);
+                        const auto v = body * std::sin (w + tine * std::sin (w * 14.0) + 0.6 * body * std::sin (w));
+                        for (int ch = 0; ch < 2; ++ch)
+                        {
+                            const auto trem = 1.0 + 0.2 * std::sin (2.0 * juce::MathConstants<double>::pi * 4.8 * i / genRate + ch * juce::MathConstants<double>::pi);
+                            b.addSample (ch, i, (float) (v * trem));
+                        }
+                    }
+                }
+                dsp::Random rng (9);
+                for (int i = 0; i < n; ++i)
+                    if (rng.uniform() < 0.0006f)
+                    {
+                        const auto click = rng.bipolar() * 0.08f;
+                        b.addSample (0, i, click);
+                        b.addSample (1, i, click);
+                    }
+                normalise (b, 0.7f);
+                return b;
+            }
         }
 
         SourceData::Ptr loadFile (const juce::File& file, juce::String& error)
@@ -383,6 +551,10 @@ namespace thf::grain
                 case 3: audio = bell();   break;
                 case 4: audio = noise();  break;
                 case 5: audio = glass();  break;
+                case 6: audio = vocalPhrase(); break;
+                case 7: audio = chordStack(); break;
+                case 8: audio = pluck(); break;
+                case 9: audio = keys(); break;
                 default: return nullptr;
             }
             return SourceData::fromBuffer (audio, genRate, "");
