@@ -78,6 +78,9 @@ namespace thf::grain
             juce::ParameterID (pid::root, version), "Root", 0, 127, 60,
             juce::AudioParameterIntAttributes().withStringFromValueFunction ([] (int v, int) { return noteName (v); })));
         layout.add (percentParam (pid::position, "Position", 0.25f));
+        layout.add (percentParam (pid::regionStart, "Sample Start", 0.0f));
+        layout.add (percentParam (pid::regionEnd, "Sample End", 1.0f));
+        layout.add (boolParam (pid::normalize, "Normalize", true));
         layout.add (floatParam (pid::scan, "Scan", Range (-2.0f, 2.0f), 0.0f,
                                 [] (float v) { return juce::String (v, 2) + "x"; }));
         layout.add (choiceParam (pid::scanMode, "Scan Mode", scanModeChoices, 0));

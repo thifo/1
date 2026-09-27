@@ -6,6 +6,7 @@ thifo_add_plugin(thfGrain
     SOURCES
         Source/Parameters.cpp
         Source/Presets.cpp
+        Source/SampleLibrary.cpp
         Source/PluginProcessor.cpp
         Source/PluginEditor.cpp
         Source/dsp/GrainEngine.cpp

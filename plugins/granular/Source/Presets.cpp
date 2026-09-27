@@ -306,11 +306,35 @@ namespace thf::grain
                 ranged->setValueNotifyingHost (ranged->getDefaultValue());
     }
 
+    PresetManager::SampleKeep PresetManager::captureLockedSample() const
+    {
+        SampleKeep keep;
+        if (! processor.isSampleLocked())
+            return keep;
+        keep.active = true;
+        for (auto* id : { pid::source, pid::regionStart, pid::regionEnd, pid::root, pid::fine, pid::normalize })
+            keep.values.push_back ({ id, processor.param (id)->getValue() });
+        for (int i = 0; i < 8; ++i)
+            keep.cues[(size_t) i] = processor.getCue (i);
+        return keep;
+    }
+
+    void PresetManager::restoreLockedSample (const SampleKeep& keep)
+    {
+        if (! keep.active)
+            return;
+        for (const auto& [id, value] : keep.values)
+            processor.param (id)->setValueNotifyingHost (value);
+        for (int i = 0; i < 8; ++i)
+            processor.setCue (i, keep.cues[(size_t) i]);
+    }
+
     void PresetManager::loadFactory (int index)
     {
         const auto& factory = factoryPresets();
         if (index < 0 || index >= (int) factory.size())
             return;
+        const auto keep = captureLockedSample();
         processor.getUndoManager().beginNewTransaction();
         resetToDefaults();
         for (const auto& [id, value] : factory[(size_t) index].values)
@@ -318,6 +342,7 @@ namespace thf::grain
                 p->setValueNotifyingHost (p->convertTo0to1 (value));
         for (int i = 0; i < 8; ++i)
             processor.setCue (i, -1.0f);
+        restoreLockedSample (keep);
         processor.getUndoManager().beginNewTransaction();
         currentName = factory[(size_t) index].name;
         if (onChange) onChange();
@@ -329,6 +354,7 @@ namespace thf::grain
         if (xml == nullptr || ! xml->hasTagName ("thfGrainPreset"))
             return false;
 
+        const auto keep = captureLockedSample();
         processor.getUndoManager().beginNewTransaction();
         resetToDefaults();
         for (auto* child : xml->getChildWithTagNameIterator ("PARAM"))
@@ -343,12 +369,20 @@ namespace thf::grain
             {
                 if (auto current = processor.getUserSample())
                 {
-                    const auto keep = processor.saveExtraState (false).getChildWithName ("Sample");
-                    if (keep.isValid())
-                        tree.addChild (keep.createCopy(), -1, nullptr);
+                    const auto currentSample = processor.saveExtraState (false).getChildWithName ("Sample");
+                    if (currentSample.isValid())
+                        tree.addChild (currentSample.createCopy(), -1, nullptr);
                 }
             }
+            const bool presetHasSample = tree.getChildWithName ("Sample").hasProperty ("path")
+                                         || tree.getChildWithName ("Sample").hasProperty ("flac");
             processor.restoreExtraState (tree, false);
+            if (! presetHasSample)
+                restoreLockedSample (keep);
+        }
+        else
+        {
+            restoreLockedSample (keep);
         }
         processor.getUndoManager().beginNewTransaction();
         currentName = xml->getStringAttribute ("name", file.getFileNameWithoutExtension());

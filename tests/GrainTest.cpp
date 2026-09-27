@@ -336,6 +336,86 @@ public:
             expectLessThan (quietest, 1.0e-3f);
         }
 
+        beginTest ("Region: grains only come from between Sample Start and Sample End");
+        {
+            auto src = noiseSource (4.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.regionStart = 0.5f; p.regionEnd = 0.6f;
+            p.spray = 1.0f; p.chaos = 1.0f; p.sizeMs = 20.0f; p.density = 100.0f; p.scan = 1.0f;
+            e.noteOn (60, 1.0f, p);
+            std::array<GrainEvent, 512> events {};
+            int seen = 0;
+            bool inside = true;
+            for (int i = 0; i < 40; ++i)
+            {
+                render (e, p, 2400);
+                const auto n = e.popGrainEvents (events.data(), (int) events.size());
+                for (int k = 0; k < n; ++k)
+                {
+                    inside = inside && events[(size_t) k].position >= 0.5f - 1.0e-4f
+                                    && events[(size_t) k].position + events[(size_t) k].span <= 0.6f + 1.0e-4f;
+                    ++seen;
+                }
+            }
+            expect (seen > 100);
+            expect (inside, "a grain left the region");
+        }
+
+        beginTest ("Pitch detection finds the note of a harmonic sample");
+        {
+            for (double hz : { 110.0, 220.0, 329.63, 523.25 })
+            {
+                juce::AudioBuffer<float> b (1, 96000);
+                double phase = 0.0;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                {
+                    b.setSample (0, i, (float) (0.4 * (2.0 * phase - 1.0) + 0.2 * std::sin (4.0 * juce::MathConstants<double>::pi * phase)));
+                    phase += hz / rate;
+                    if (phase >= 1.0) phase -= 1.0;
+                }
+                auto s = SourceData::fromBuffer (b, rate, "saw");
+                sources::detectPitch (*s);
+                const auto expected = 69.0 + 12.0 * std::log2 (hz / 440.0);
+                logMessage ("  " + juce::String (hz) + " Hz -> " + juce::String (s->detectedNote, 2)
+                            + " (confidence " + juce::String (s->pitchConfidence, 2) + ")");
+                expectWithinAbsoluteError ((double) s->detectedNote, expected, 0.1);
+            }
+            auto noise = noiseSource (2.0);
+            sources::detectPitch (*const_cast<SourceData*> (noise.get()));
+            expect (noise->detectedNote < 0.0f || noise->pitchConfidence < 0.5f, "noise reported as pitched");
+        }
+
+        beginTest ("Tiny sources in HQ, pitched far up: every octave copy exists, reads stay inside");
+        {
+            for (int length : { 10, 100, 200, 600, 1000 })
+            {
+                juce::AudioBuffer<float> b (2, length);
+                for (int i = 0; i < length; ++i)
+                {
+                    b.setSample (0, i, std::sin ((float) i * 0.3f));
+                    b.setSample (1, i, std::cos ((float) i * 0.3f));
+                }
+                auto src = SourceData::fromBuffer (b, 96000.0, "tiny");
+                expectEquals (src->getNumLevels(), SourceData::maxLevels);
+                GrainEngine e;
+                e.prepare (44100.0);
+                e.setSource (src.get());
+                auto p = plain();
+                p.hq = true; p.pitch = 24.0f; p.jitter = 24.0f; p.spray = 1.0f; p.chaos = 1.0f;
+                p.bendRange = 24.0f; p.density = 80.0f;
+                e.setPitchBend (1.0f);
+                e.noteOn (108, 1.0f, p);
+                std::vector<float> r;
+                const auto out = render (e, p, 22050, &r);
+                bool finite = true;
+                for (size_t i = 0; i < out.size(); ++i) finite = finite && std::isfinite (out[i]) && std::isfinite (r[i]);
+                expect (finite, "length " + juce::String (length));
+            }
+        }
+
         beginTest ("No source: silence, no crash");
         {
             GrainEngine e;
@@ -615,6 +695,51 @@ public:
                 expectEquals (s->contentHash, hash);
             }
             expect ((int) b.param (pid::source)->convertFrom0to1 (b.param (pid::source)->getValue()) == 0);
+        }
+
+        beginTest ("Detected pitch becomes Root + Fine");
+        {
+            GrainProcessor p;
+            juce::AudioBuffer<float> b (1, 96000);
+            for (int i = 0; i < b.getNumSamples(); ++i)                 // A3 a little sharp: 222 Hz
+                b.setSample (0, i, 0.5f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 222.0 * i / rate)
+                                 + 0.2f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 444.0 * i / rate));
+            auto s = SourceData::fromBuffer (b, rate, "a3");
+            sources::detectPitch (*s);
+            p.setUserSample (s);
+            expect (p.applyDetectedRoot());
+            expectEquals ((int) p.param (pid::root)->convertFrom0to1 (p.param (pid::root)->getValue()), 57);
+            const auto fine = p.param (pid::fine)->convertFrom0to1 (p.param (pid::fine)->getValue());
+            expectWithinAbsoluteError (fine, -15.6f, 1.5f);   // 222 Hz is +15.6 ct above A3
+        }
+
+        beginTest ("Locked own sample survives preset changes; a new sample resets region and cues");
+        {
+            GrainProcessor p;
+            juce::AudioBuffer<float> b (1, 48000);
+            for (int i = 0; i < b.getNumSamples(); ++i) b.setSample (0, i, 0.3f * std::sin ((float) i * 0.03f));
+            auto s = SourceData::fromBuffer (b, rate, "one");
+            s->contentHash = "one";
+            p.setUserSample (s);
+            p.param (pid::regionStart)->setValueNotifyingHost (0.2f);
+            p.param (pid::regionEnd)->setValueNotifyingHost (0.7f);
+            p.setCue (3, 0.5f);
+            p.getPresets().loadFactory (5);
+            expectEquals ((int) p.param (pid::source)->convertFrom0to1 (p.param (pid::source)->getValue()), 0);
+            expectWithinAbsoluteError (p.param (pid::regionStart)->getValue(), 0.2f, 1.0e-6f);
+            expectWithinAbsoluteError (p.getCue (3), 0.5f, 1.0e-6f);
+
+            p.setKeepSample (false);
+            p.getPresets().loadFactory (5);
+            expect ((int) p.param (pid::source)->convertFrom0to1 (p.param (pid::source)->getValue()) != 0);
+
+            auto other = SourceData::fromBuffer (b, rate, "two");
+            other->contentHash = "two";
+            p.setCue (3, 0.5f);
+            p.param (pid::regionEnd)->setValueNotifyingHost (0.4f);
+            p.setUserSample (other);
+            expectEquals (p.getCue (3), -1.0f);
+            expectEquals (p.param (pid::regionEnd)->getValue(), 1.0f);
         }
 
         beginTest ("Factory presets load and only use known parameters");

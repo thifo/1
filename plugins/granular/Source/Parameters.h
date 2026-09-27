@@ -12,6 +12,9 @@ namespace thf::grain
         inline constexpr const char* source     = "source";
         inline constexpr const char* root       = "root";
         inline constexpr const char* position   = "position";
+        inline constexpr const char* regionStart= "regionStart";
+        inline constexpr const char* regionEnd  = "regionEnd";
+        inline constexpr const char* normalize  = "normalize";
         inline constexpr const char* scan       = "scan";
         inline constexpr const char* scanMode   = "scanMode";
         inline constexpr const char* freeze     = "freeze";

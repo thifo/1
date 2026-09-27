@@ -48,6 +48,16 @@ namespace thf::grain
         std::function<void()> onChange;
 
     private:
+        // What a locked sample keeps across preset changes.
+        struct SampleKeep
+        {
+            bool active = false;
+            std::vector<std::pair<juce::String, float>> values;   // normalised
+            std::array<float, 8> cues {};
+        };
+        SampleKeep captureLockedSample() const;
+        void restoreLockedSample (const SampleKeep&);
+
         void resetToDefaults();
         GrainProcessor& processor;
         juce::String currentName { "Init" };

@@ -1,5 +1,6 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
+#include "SampleLibrary.h"
 #include <i18n/Translator.h>
 
 namespace thf::grain
@@ -192,6 +193,15 @@ namespace thf::grain
         };
         noFocus (content);
         setWantsKeyboardFocus (false);
+        content.addMouseListener (this, true);
+    }
+
+    void GrainEditor::mouseDown (const juce::MouseEvent&)
+    {
+        // A click anywhere in the plug-in hands the computer keyboard to the on-screen keys,
+        // unless a text field (preset name) is being edited.
+        if (dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) == nullptr)
+            keyboard.grabKeyboardFocus();
     }
 
     GrainEditor::~GrainEditor()
@@ -496,11 +506,14 @@ namespace thf::grain
         refreshPads();
         keyboard.setPadChannel (processor.getPadsAsControls() ? processor.getPadChannel() : 17);
 
-        // Keep the computer keys playing unless a text field is being edited.
-        if (isShowing() && ! keyboard.hasKeyboardFocus (false)
-            && dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) == nullptr
-            && juce::Component::getCurrentlyModalComponent() == nullptr)
+        // Standalone: the window is ours, so the computer keys play as soon as it opens.
+        // In a host the keyboard only takes focus when the plug-in window is clicked
+        // (mouseDown below): grabbing it from a timer would steal the host's keyboard.
+        if (juce::JUCEApplicationBase::isStandaloneApp() && ! standaloneFocusTaken && isShowing())
+        {
             keyboard.grabKeyboardFocus();
+            standaloneFocusTaken = true;
+        }
 
         pitchStrip.setValue (processor.getPitchStrip());
         modStrip.setValue (processor.getModStrip());
@@ -612,7 +625,11 @@ namespace thf::grain
 
     void GrainEditor::chooseSample()
     {
-        chooser = std::make_unique<juce::FileChooser> (tr ("Load sample"), juce::File(), "*.wav;*.aif;*.aiff;*.flac");
+        // Starts where the last sample came from; offers every format the platform reads.
+        const auto recentFiles = library::recent();
+        const auto start = recentFiles.isEmpty() ? library::userFolder() : recentFiles.getFirst().getParentDirectory();
+        chooser = std::make_unique<juce::FileChooser> (tr ("Load sample"), start,
+                                                       "*." + sources::audioExtensions().replace (";", ";*."));
         chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
                               [this] (const juce::FileChooser& fc)
                               {
@@ -625,7 +642,7 @@ namespace thf::grain
     bool GrainEditor::isInterestedInFileDrag (const juce::StringArray& files)
     {
         for (auto& f : files)
-            if (juce::File (f).hasFileExtension ("wav;aif;aiff;flac"))
+            if (juce::File (f).hasFileExtension (sources::audioExtensions()))
                 return true;
         return false;
     }
@@ -637,7 +654,7 @@ namespace thf::grain
     {
         waveform.setDropHighlight (false);
         for (auto& f : files)
-            if (juce::File (f).hasFileExtension ("wav;aif;aiff;flac"))
+            if (juce::File (f).hasFileExtension (sources::audioExtensions()))
             {
                 processor.loadSampleAsync (juce::File (f));
                 return;

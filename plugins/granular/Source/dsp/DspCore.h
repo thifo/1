@@ -155,7 +155,8 @@ namespace thf::grain::dsp
         // 1/stretch. Compute once, apply to every channel with dot().
         int weights (float frac, float stretch, float invStretch, float* w, int& first) const noexcept
         {
-            const auto reach = juce_ceil (halfTaps * stretch);
+            // Never reach further than the padding allows (stretch is clamped to 2 by callers).
+            const auto reach = juce_ceil (halfTaps * std::fmin (stretch, 2.0f));
             first = -reach + 1;
             const auto count = 2 * reach;
             const auto scale = invStretch * (float) resolution;

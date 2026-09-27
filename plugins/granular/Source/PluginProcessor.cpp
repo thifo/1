@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "SampleLibrary.h"
 
 namespace thf::grain
 {
@@ -52,6 +53,7 @@ namespace thf::grain
             jitter = get (pid::jitter); reverse = get (pid::reverse); stereo = get (pid::stereo);
             quantize = get (pid::quantize); lfoMode = get (pid::lfoMode); lfoDivision = get (pid::lfoDivision);
             space = get (pid::space); spaceSize = get (pid::spaceSize);
+            regionStart = get (pid::regionStart); regionEnd = get (pid::regionEnd); normalize = get (pid::normalize);
             voices = get (pid::voices); voiceMode = get (pid::voiceMode); glide = get (pid::glide);
             hold = get (pid::hold); bendRange = get (pid::bendRange); velocity = get (pid::velocity);
             attack = get (pid::attack); decay = get (pid::decay); sustain = get (pid::sustain);
@@ -68,7 +70,7 @@ namespace thf::grain
             *voiceMode, *glide, *hold, *bendRange, *velocity, *attack, *decay, *sustain, *release,
             *filterType, *cutoff, *resonance, *filterEnv, *filterDecay, *drive, *lfoRate, *lfoDepth,
             *lfoShape, *lfoTarget, *modTarget, *modDepth, *output, *safeClip, *hq,
-            *quantize, *lfoMode, *lfoDivision, *space, *spaceSize;
+            *quantize, *lfoMode, *lfoDivision, *space, *spaceSize, *regionStart, *regionEnd, *normalize;
     };
 
     //==============================================================================
@@ -135,6 +137,9 @@ namespace thf::grain
         const auto& r = *raw;
         EngineParams p;
         p.position = r.position->load();
+        p.regionStart = r.regionStart->load();
+        p.regionEnd = r.regionEnd->load();
+        p.normalizeSource = r.normalize->load() > 0.5f;
         p.scan = r.scan->load();
         p.perNoteScan = r.scanMode->load() > 0.5f;
         p.freeze = r.freeze->load() > 0.5f;
@@ -593,8 +598,22 @@ namespace thf::grain
         sourceSerial.fetch_add (1);
     }
 
+    bool GrainProcessor::isSampleLocked() const
+    {
+        return keepSample.load() && getUserSample() != nullptr && raw->source->load() < 0.5f;
+    }
+
     void GrainProcessor::setUserSample (SourceData::Ptr s)
     {
+        // A different sample: the old region and cues point at nothing meaningful any more.
+        const auto previous = getUserSample();
+        if (s != nullptr && (previous == nullptr || previous->contentHash != s->contentHash))
+        {
+            for (auto& c : cues) c.store (-1.0f);
+            for (auto* id : { pid::regionStart, pid::regionEnd })
+                if (auto* p = param (id))
+                    p->setValueNotifyingHost (p->getDefaultValue());
+        }
         publishSource (s);
         if (auto* p = param (pid::source))
             p->setValueNotifyingHost (0.0f);    // "Sample"
@@ -632,6 +651,31 @@ namespace thf::grain
             return false;
         attachEmbedding (*s);
         setUserSample (s);
+        library::addRecent (file);
+        return true;
+    }
+
+    void GrainProcessor::clearUserSample()
+    {
+        publishSource (nullptr);
+    }
+
+    bool GrainProcessor::applyDetectedRoot()
+    {
+        const auto s = getUserSample();
+        if (s == nullptr || s->detectedNote < 0.0f)
+            return false;
+        const auto root = juce::roundToInt (s->detectedNote);
+        auto set = [this] (const char* id, float value)
+        {
+            auto* p = param (id);
+            p->beginChangeGesture();
+            p->setValueNotifyingHost (p->convertTo0to1 (value));
+            p->endChangeGesture();
+        };
+        undoManager.beginNewTransaction();
+        set (pid::root, (float) juce::jlimit (0, 127, root));
+        set (pid::fine, juce::jlimit (-100.0f, 100.0f, -(s->detectedNote - (float) root) * 100.0f));
         return true;
     }
 
@@ -656,7 +700,10 @@ namespace thf::grain
                     return;
                 loading.store (false);
                 if (s != nullptr)
+                {
                     setUserSample (s);
+                    library::addRecent (s->file);
+                }
                 else
                 {
                     const juce::ScopedLock l (statusLock);
@@ -712,6 +759,8 @@ namespace thf::grain
         juce::StringArray cueList;
         for (auto& c : cues) cueList.add (juce::String (c.load(), 6));
         extra.setProperty ("cues", cueList.joinIntoString (","), nullptr);
+        if (includeMidi)   // session setting, never part of a preset
+            extra.setProperty ("keepSample", keepSample.load(), nullptr);
 
         if (auto s = getUserSample())
         {
@@ -752,6 +801,8 @@ namespace thf::grain
 
     void GrainProcessor::restoreExtraState (const juce::ValueTree& extra, bool includeMidi)
     {
+        if (includeMidi && extra.hasProperty ("keepSample"))
+            keepSample.store ((bool) extra.getProperty ("keepSample"));
         const auto cueList = juce::StringArray::fromTokens (extra.getProperty ("cues").toString(), ",", "");
         for (size_t i = 0; i < cues.size(); ++i)
             cues[i].store (i < (size_t) cueList.size() ? juce::jlimit (-1.0f, 1.0f, cueList[(int) i].getFloatValue()) : -1.0f);
@@ -780,9 +831,14 @@ namespace thf::grain
                     loaded->embeddedFlac = flac;
                 }
             }
-            if (loaded == nullptr && file.existsAsFile())
+            // Not embedded (too long): the file itself, or the same file name where the user
+            // keeps samples (moved projects, another computer).
+            auto candidate = file;
+            if (loaded == nullptr && ! candidate.existsAsFile() && file.getFileName().isNotEmpty())
+                candidate = library::findMissing (file);
+            if (loaded == nullptr && candidate.existsAsFile())
             {
-                loaded = sources::loadFile (file, error);
+                loaded = sources::loadFile (candidate, error);
                 if (loaded != nullptr)
                     attachEmbedding (*loaded);
             }

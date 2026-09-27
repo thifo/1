@@ -72,9 +72,9 @@ namespace thf::grain
         for (int level = 1; level < maxLevels; ++level)
         {
             const auto prevLength = s->levelLengths.back();
-            const auto newLength = (prevLength + 1) / 2;
-            if (newLength < 64)
-                break;
+            // Every level is built, even for tiny sources: the grain reader relies on the
+            // top level bringing any ratio <= 32 down to an effective ratio <= 1.
+            const auto newLength = juce::jmax (1, (prevLength + 1) / 2);
             auto next = padded (s->numChannels, newLength);
             const auto& prev = s->levels.back();
             for (int ch = 0; ch < s->numChannels; ++ch)
@@ -95,6 +95,18 @@ namespace thf::grain
             }
             s->levels.push_back (std::move (next));
             s->levelLengths.push_back (newLength);
+        }
+
+        // Level normalisation: peak to 0.7 (-3 dBFS), never more than +30 dB.
+        {
+            float peak = 0.0f;
+            for (int ch = 0; ch < s->numChannels; ++ch)
+            {
+                const auto* d = s->channel (0, ch);
+                for (int i = 0; i < s->length; ++i)
+                    peak = juce::jmax (peak, std::abs (d[i]));
+            }
+            s->normalGain = peak > 1.0e-6f ? juce::jmin (31.6f, 0.7f / peak) : 1.0f;
         }
 
         // Peak overview.
@@ -166,6 +178,7 @@ namespace thf::grain
                 reader->read (&audio, 0, audio.getNumSamples(), 0, true, channels > 1);
                 auto source = SourceData::fromBuffer (audio, reader->sampleRate, name);
                 source->contentHash = hashOf (audio);
+                detectPitch (*source);
                 return source;
             }
 
@@ -509,6 +522,16 @@ namespace thf::grain
             }
         }
 
+        juce::String audioExtensions()
+        {
+            // Everything the format manager reads (CoreAudio adds mp3/m4a/caf on macOS).
+            juce::StringArray extensions;
+            for (auto* format : formats())
+                for (auto ext : format->getFileExtensions())
+                    extensions.addIfNotAlreadyThere (ext.trimCharactersAtStart ("."));
+            return extensions.joinIntoString (";");
+        }
+
         SourceData::Ptr loadFile (const juce::File& file, juce::String& error)
         {
             auto source = fromReader (formats().createReaderFor (file), file.getFileName(), error);
@@ -558,6 +581,80 @@ namespace thf::grain
                 default: return nullptr;
             }
             return SourceData::fromBuffer (audio, genRate, "");
+        }
+
+        void detectPitch (SourceData& s)
+        {
+            // YIN (de Cheveigné & Kawahara) on up to 8 of the loudest 46 ms windows of the
+            // mono mix; the median of confident estimates wins.
+            const auto rate = s.getSampleRate();
+            const int window = juce::nextPowerOfTwo ((int) (0.046 * rate));
+            const int maxLag = juce::jmin (window - 2, (int) (rate / 40.0));    // down to 40 Hz
+            const int minLag = juce::jmax (2, (int) (rate / 2000.0));           // up to 2 kHz
+            const auto length = s.getLength();
+            if (length < 2 * window)
+                return;
+
+            std::vector<float> mono ((size_t) length);
+            for (int ch = 0; ch < s.getNumChannels(); ++ch)
+            {
+                const auto* d = s.channel (0, ch);
+                for (int i = 0; i < length; ++i) mono[(size_t) i] += d[i];
+            }
+
+            std::vector<std::pair<float, int>> energies;
+            for (int start = 0; start + 2 * window < length; start += window / 2)
+            {
+                float e = 0.0f;
+                for (int i = 0; i < window; ++i) e += mono[(size_t) (start + i)] * mono[(size_t) (start + i)];
+                energies.push_back ({ e, start });
+            }
+            std::sort (energies.begin(), energies.end(), [] (auto& a, auto& b) { return a.first > b.first; });
+
+            std::vector<float> diff ((size_t) maxLag + 2), notes;
+            float confidenceSum = 0.0f;
+            for (size_t w = 0; w < juce::jmin ((size_t) 8, energies.size()); ++w)
+            {
+                const auto* x = mono.data() + energies[w].second;
+                for (int tau = 1; tau <= maxLag; ++tau)
+                {
+                    float sum = 0.0f;
+                    for (int i = 0; i < window; ++i) { const auto d = x[i] - x[i + tau]; sum += d * d; }
+                    diff[(size_t) tau] = sum;
+                }
+                // Cumulative mean normalised difference.
+                float running = 0.0f;
+                diff[0] = 1.0f;
+                for (int tau = 1; tau <= maxLag; ++tau)
+                {
+                    running += diff[(size_t) tau];
+                    diff[(size_t) tau] = running > 0.0f ? diff[(size_t) tau] * (float) tau / running : 1.0f;
+                }
+                int best = -1;
+                for (int tau = minLag; tau < maxLag; ++tau)
+                    if (diff[(size_t) tau] < 0.15f)
+                    {
+                        while (tau + 1 < maxLag && diff[(size_t) tau + 1] < diff[(size_t) tau]) ++tau;
+                        best = tau;
+                        break;
+                    }
+                if (best < 0)
+                    continue;
+                const auto a = diff[(size_t) best - 1], b = diff[(size_t) best], c = diff[(size_t) best + 1];
+                const auto denom = a - 2.0f * b + c;
+                const auto shift = std::abs (denom) > 1.0e-9f ? 0.5f * (a - c) / denom : 0.0f;
+                const auto hz = rate / ((double) best + shift);
+                notes.push_back ((float) (69.0 + 12.0 * std::log2 (hz / 440.0)));
+                confidenceSum += 1.0f - b;
+            }
+            if (notes.size() < 3)
+                return;
+            std::sort (notes.begin(), notes.end());
+            const auto median = notes[notes.size() / 2];
+            int agreeing = 0;
+            for (auto note : notes) if (std::abs (note - median) < 0.5f) ++agreeing;
+            s.detectedNote = median;
+            s.pitchConfidence = juce::jlimit (0.0f, 1.0f, (confidenceSum / (float) notes.size()) * (float) agreeing / (float) notes.size());
         }
 
         juce::String hashOf (const juce::AudioBuffer<float>& audio)

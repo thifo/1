@@ -37,6 +37,9 @@ namespace thf::grain
         // The original audio, unpadded (for saving into a session).
         juce::AudioBuffer<float> copyOriginal() const;
 
+        // Gain that brings the sample's peak to the level of the built-in sources (-3 dBFS).
+        float getNormalGain() const noexcept { return normalGain; }
+
         const std::vector<float>& getPeakMin() const noexcept { return peakMin; }
         const std::vector<float>& getPeakMax() const noexcept { return peakMax; }
 
@@ -44,6 +47,8 @@ namespace thf::grain
         juce::File file;
         juce::String contentHash;
         juce::MemoryBlock embeddedFlac;   // for sessions; empty if the sample is too long
+        float detectedNote = -1.0f;       // fractional MIDI note of the sample's pitch, -1 = none
+        float pitchConfidence = 0.0f;     // 0..1
 
     private:
         SourceData() = default;
@@ -54,6 +59,7 @@ namespace thf::grain
         std::vector<juce::AudioBuffer<float>> levels;
         std::vector<int> levelLengths;
         std::vector<float> peakMin, peakMax;
+        float normalGain = 1.0f;
     };
 
     // Loading and generation helpers (message or background thread only).
@@ -77,5 +83,12 @@ namespace thf::grain
         SourceData::Ptr generate (int sourceChoice);
 
         juce::String hashOf (const juce::AudioBuffer<float>&);
+
+        // Extensions the platform can read, e.g. "wav;aif;aiff;flac;mp3;m4a;caf" on macOS.
+        juce::String audioExtensions();
+
+        // Fundamental of a pitched sample (YIN over several loud windows). Fills
+        // detectedNote / pitchConfidence; leaves -1 for unpitched material.
+        void detectPitch (SourceData&);
     }
 }

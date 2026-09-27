@@ -324,6 +324,9 @@ namespace thf::grain
 
     bool PlayKeyboard::keyPressed (const juce::KeyPress& key)
     {
+        // Command shortcuts (undo, copy...) belong to the host, never to the notes.
+        if (key.getModifiers().isCommandDown() || key.getModifiers().isCtrlDown())
+            return false;
         switch (juce::CharacterFunctions::toLowerCase (key.getTextCharacter()))
         {
             case 'z': shiftOctave (-1); return true;

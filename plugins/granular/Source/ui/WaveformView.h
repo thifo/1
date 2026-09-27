@@ -4,8 +4,9 @@
 
 namespace thf::grain
 {
-    // The main glass screen: source waveform, playhead, spray range, live grains and cues.
-    // Drag = Position (x) and Spray (y), wheel = Size, shift-wheel = Spray.
+    // The main glass screen: source waveform, region, playhead, spray range, live grains and
+    // cues, plus the sample bar (< Sample >). Drag = Position (x) and Spray (y), drag the
+    // region handles = Sample Start / End, wheel = Size, shift-wheel = Spray.
     class WaveformView : public juce::Component
     {
     public:
@@ -16,6 +17,7 @@ namespace thf::grain
         void setDropHighlight (bool b) { if (b != dropHighlight) { dropHighlight = b; repaint(); } }
 
         void paint (juce::Graphics&) override;
+        void resized() override;
         void mouseDown (const juce::MouseEvent&) override;
         void mouseDrag (const juce::MouseEvent&) override;
         void mouseUp (const juce::MouseEvent&) override;
@@ -28,6 +30,16 @@ namespace thf::grain
         float xToPosition (float x) const;
         float positionToX (float p) const;
         void showMenu (const juce::MouseEvent&);
+        void showSampleMenu();
+        void stepSample (int delta);
+        float regionStart() const;
+        float regionEnd() const;
+        float toAbsolute (float relative) const;   // region-relative 0..1 -> file 0..1
+        float toRelative (float absolute) const;
+
+        enum class Drag { none, position, regionStart, regionEnd };
+        Drag drag = Drag::none;
+        juce::TextButton prevSample { "<" }, sampleButton, nextSample { ">" };
 
         UiContext& ctx;
         SourceData::Ptr source;

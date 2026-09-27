@@ -394,10 +394,16 @@ namespace thf::grain
                                          std::exp2 ((double) semis / 12.0) * source->getSampleRate() / sampleRate);
         const auto span0 = (double) sizeSamples * ratio;
 
+        // Position, spray and scan are relative to the region; grains stay inside it when they fit.
+        const auto regionStart = juce::jlimit (0.0, 1.0, (double) juce::jmin (p.regionStart, p.regionEnd));
+        const auto regionLength = juce::jmax (1.0e-3, juce::jlimit (0.0, 1.0, (double) juce::jmax (p.regionStart, p.regionEnd)) - regionStart);
         const auto scanOffset = p.perNoteScan ? v.scanOffset : globalScan;
         const auto spray = juce::jlimit (0.0f, 1.0f, p.spray + modulation.spray);
-        const auto start01 = wrap01 ((double) p.position + modulation.position + scanOffset + rSpray * spray);
-        const auto start0 = juce::jlimit (0.0, juce::jmax (0.0, length0 - span0), (double) start01 * length0);
+        const auto relative = wrap01 ((double) p.position + modulation.position + scanOffset + rSpray * spray);
+        const auto lo = regionStart * length0;
+        const auto hi = (regionStart + regionLength) * length0;
+        const auto start0 = juce::jlimit (0.0, juce::jmax (0.0, length0 - span0),
+                                          juce::jlimit (lo, juce::jmax (lo, hi - span0), lo + relative * (hi - lo)));
         const bool reversed = rReverse < p.reverse;
 
         // Octave copy: HQ reads the copy just below the ratio and band-limits the rest with a
@@ -414,12 +420,15 @@ namespace thf::grain
         g->level = level;
         g->step = reversed ? -effective : effective;
         g->readPos = (reversed ? start0 + span0 - ratio : start0) * scale;
-        g->stretch = p.hq ? (float) juce::jmax (1.0, effective) : 1.0f;
+        g->stretch = p.hq ? (float) juce::jlimit (1.0, 2.0, effective) : 1.0f;
         g->age = 0;
         g->length = juce::jmax (1, (int) sizeSamples);
         g->invLength = 1.0f / (float) g->length;
         g->fade = fade;
         g->startOffset = offset;
+
+        if (p.normalizeSource)
+            normGain *= source->getNormalGain();
 
         const auto pan = p.stereo * rPan;
         const auto angle = (pan + 1.0f) * dsp::pi * 0.25f;
@@ -471,7 +480,10 @@ namespace thf::grain
         // Playhead.
         double scanStep = 0.0;
         if (source != nullptr && ! p.freeze)
-            scanStep = (double) p.scan * source->getSampleRate() / (sampleRate * source->getLength()) * n;
+        {
+            const auto regionLength = juce::jmax (1.0e-3f, std::abs (p.regionEnd - p.regionStart));
+            scanStep = (double) p.scan * source->getSampleRate() / (sampleRate * source->getLength() * regionLength) * n;
+        }
         globalScan = wrap01 (globalScan + scanStep);
 
         // Grain timing and size (shared by all voices this block).

@@ -1,4 +1,5 @@
 #include "WaveformView.h"
+#include "../SampleLibrary.h"
 #include <i18n/Translator.h>
 
 namespace thf::grain
@@ -18,6 +19,46 @@ namespace thf::grain
     WaveformView::WaveformView (UiContext& c) : ctx (c)
     {
         live.reserve (512);
+        for (auto* b : { &prevSample, &sampleButton, &nextSample })
+        {
+            b->setColour (juce::TextButton::buttonColourId, glassRaised);
+            b->setColour (juce::TextButton::textColourOffId, glassText);
+            addAndMakeVisible (b);
+        }
+        prevSample.onClick = [this] { stepSample (-1); };
+        nextSample.onClick = [this] { stepSample (1); };
+        sampleButton.onClick = [this] { showSampleMenu(); };
+    }
+
+    void WaveformView::resized()
+    {
+        // Sample bar sits left of the editor's "More" button (right 120 px of the header).
+        auto bar = juce::Rectangle<int> (getWidth() - 128 - 236, 8, 236, 26);
+        prevSample.setBounds (bar.removeFromLeft (30));
+        nextSample.setBounds (bar.removeFromRight (30));
+        sampleButton.setBounds (bar.reduced (4, 0));
+    }
+
+    float WaveformView::regionStart() const
+    {
+        const auto& s = ctx.processor.getState();
+        return juce::jmin (s.getRawParameterValue (pid::regionStart)->load(), s.getRawParameterValue (pid::regionEnd)->load());
+    }
+
+    float WaveformView::regionEnd() const
+    {
+        const auto& s = ctx.processor.getState();
+        return juce::jmax (s.getRawParameterValue (pid::regionStart)->load(), s.getRawParameterValue (pid::regionEnd)->load());
+    }
+
+    float WaveformView::toAbsolute (float relative) const
+    {
+        return regionStart() + relative * juce::jmax (1.0e-3f, regionEnd() - regionStart());
+    }
+
+    float WaveformView::toRelative (float absolute) const
+    {
+        return juce::jlimit (0.0f, 1.0f, (absolute - regionStart()) / juce::jmax (1.0e-3f, regionEnd() - regionStart()));
     }
 
     juce::Rectangle<float> WaveformView::waveArea() const
@@ -48,6 +89,9 @@ namespace thf::grain
             sourceChoice = choice;
             source = proc.getCurrentSourceForDisplay();
             live.clear();
+            const auto label = choice == 0 ? (source != nullptr ? tr ("Sample") : tr ("Load sample..."))
+                                           : tr (sourceChoices[choice]);
+            sampleButton.setButtonText (label + juce::String::fromUTF8 (" \xe2\x96\xbe"));
         }
 
         const auto now = juce::Time::getMillisecondCounter();
@@ -94,7 +138,14 @@ namespace thf::grain
             title << sep() << formatSeconds (source->getDurationSeconds())
                   << sep() << juce::String (source->getSampleRate() / 1000.0, 1) << " kHz";
         title << sep() << tr ("Root") << " " << noteName ((int) proc.getState().getRawParameterValue (pid::root)->load());
-        g.drawText (title, header.withTrimmedRight (240), juce::Justification::centredLeft);
+        if (sourceChoice == 0 && source != nullptr)
+        {
+            if (source->detectedNote >= 0.0f)
+                title << sep() << tr ("pitch") << " " << noteName (juce::roundToInt (source->detectedNote));
+            if (source->embeddedFlac.getSize() == 0)
+                title << sep() << tr ("not saved in the project");
+        }
+        g.drawFittedText (title, header.withTrimmedRight (372), juce::Justification::centredLeft, 1);
 
         // Grid.
         g.setColour (glassGrid);
@@ -145,10 +196,23 @@ namespace thf::grain
         g.setColour (glassText.withAlpha (0.55f));
         g.fillPath (wave);
 
-        // Spray range around the playhead.
+        // Region: everything outside is dimmed, the edges are draggable handles.
+        const auto xStart = positionToX (regionStart()), xEnd = positionToX (regionEnd());
+        g.setColour (glass.withAlpha (0.62f));
+        g.fillRect (juce::Rectangle<float> (area.getX(), area.getY(), xStart - area.getX(), area.getHeight()));
+        g.fillRect (juce::Rectangle<float> (xEnd, area.getY(), area.getRight() - xEnd, area.getHeight()));
+        for (auto hx : { xStart, xEnd })
+        {
+            g.setColour (accentYellow.withAlpha (0.85f));
+            g.fillRect (juce::Rectangle<float> (hx - 1.0f, area.getY(), 2.0f, area.getHeight()));
+            g.fillRoundedRectangle (juce::Rectangle<float> (hx - 5.0f, area.getY(), 10.0f, 14.0f), 2.0f);
+        }
+
+        // Spray range around the playhead (both relative to the region).
+        const auto regionWidth = xEnd - xStart;
         const auto spray = proc.getState().getRawParameterValue (pid::spray)->load();
-        const auto px = positionToX (playhead);
-        const auto sprayW = spray * area.getWidth();
+        const auto px = positionToX (toAbsolute (playhead));
+        const auto sprayW = spray * regionWidth;
         g.setColour (knobArc.withAlpha (0.16f));
         g.fillRect (juce::Rectangle<float> (px - sprayW * 0.5f, area.getY(), sprayW, area.getHeight()));
         if (px - sprayW * 0.5f < area.getX())   // wraps around
@@ -186,7 +250,7 @@ namespace thf::grain
             const auto cue = proc.getCue (i);
             if (cue < 0.0f)
                 continue;
-            const auto cx = positionToX (cue);
+            const auto cx = positionToX (toAbsolute (cue));
             g.setColour (accentYellow.withAlpha (0.7f));
             g.drawVerticalLine ((int) cx, area.getBottom() - 10.0f, area.getBottom() + 4.0f);
             auto tag = juce::Rectangle<float> (cx - 8.0f, area.getBottom() + 6.0f, 16.0f, 16.0f);
@@ -217,11 +281,25 @@ namespace thf::grain
         }
         if (source == nullptr)
         {
-            if (onLoadRequest) onLoadRequest();
+            if (sourceChoice == 0 && onLoadRequest) onLoadRequest();
             return;
         }
         auto& proc = ctx.processor;
         proc.getUndoManager().beginNewTransaction();
+
+        // Region handles take priority when grabbed within a few pixels.
+        const auto x = (float) e.x;
+        const auto dStart = std::abs (x - positionToX (regionStart())), dEnd = std::abs (x - positionToX (regionEnd()));
+        if (juce::jmin (dStart, dEnd) < 7.0f && waveArea().expanded (0.0f, 4.0f).contains (e.position))
+        {
+            drag = dStart <= dEnd ? Drag::regionStart : Drag::regionEnd;
+            auto* p = proc.param (drag == Drag::regionStart ? pid::regionStart : pid::regionEnd);
+            p->beginChangeGesture();
+            if (ctx.onFocus) ctx.onFocus (p->getParameterID());
+            return;
+        }
+
+        drag = Drag::position;
         dragging = true;
         dragStartY = e.y;
         dragStartSpray = proc.param (pid::spray)->getValue();
@@ -229,18 +307,28 @@ namespace thf::grain
         proc.param (pid::spray)->beginChangeGesture();
         proc.requestScanReset();
         if (! e.mods.isAltDown())
-            proc.param (pid::position)->setValueNotifyingHost (xToPosition ((float) e.x));
+            proc.param (pid::position)->setValueNotifyingHost (toRelative (xToPosition ((float) e.x)));
         if (ctx.onFocus) ctx.onFocus (pid::position);
     }
 
     void WaveformView::mouseDrag (const juce::MouseEvent& e)
     {
+        auto& proc = ctx.processor;
+        if (drag == Drag::regionStart || drag == Drag::regionEnd)
+        {
+            // Handles never cross: at least 0.5 % of the file stays between them.
+            const auto x = xToPosition ((float) e.x);
+            if (drag == Drag::regionStart)
+                proc.param (pid::regionStart)->setValueNotifyingHost (juce::jmin (x, regionEnd() - 0.005f));
+            else
+                proc.param (pid::regionEnd)->setValueNotifyingHost (juce::jmax (x, regionStart() + 0.005f));
+            return;
+        }
         if (! dragging)
             return;
-        auto& proc = ctx.processor;
         if (! e.mods.isAltDown())
         {
-            proc.param (pid::position)->setValueNotifyingHost (xToPosition ((float) e.x));
+            proc.param (pid::position)->setValueNotifyingHost (toRelative (xToPosition ((float) e.x)));
             proc.requestScanReset();
         }
         const auto dy = (float) (dragStartY - e.y) / waveArea().getHeight();
@@ -253,6 +341,9 @@ namespace thf::grain
 
     void WaveformView::mouseUp (const juce::MouseEvent&)
     {
+        if (drag == Drag::regionStart || drag == Drag::regionEnd)
+            ctx.processor.param (drag == Drag::regionStart ? pid::regionStart : pid::regionEnd)->endChangeGesture();
+        drag = Drag::none;
         if (! dragging)
             return;
         dragging = false;
@@ -286,7 +377,101 @@ namespace thf::grain
                             {
                                 if (r == 1 && onLoadRequest) onLoadRequest();
                                 if (r == 2) for (int i = 0; i < 8; ++i) proc.setCue (i, -1.0f);
-                                if (r >= 100) proc.setCue (r - 100, where);
+                                if (r >= 100) proc.setCue (r - 100, toRelative (where));
+                            });
+    }
+
+    void WaveformView::stepSample (int delta)
+    {
+        auto& proc = ctx.processor;
+        if (sourceChoice == 0)
+        {
+            // Own samples: the neighbour in the same folder, or the first of "My samples".
+            const auto current = proc.getUserSample();
+            juce::File next;
+            if (current != nullptr && current->file.existsAsFile())
+                next = library::neighbour (current->file, delta);
+            else if (const auto files = library::audioFilesIn (library::userFolder()); ! files.isEmpty())
+                next = delta > 0 ? files.getFirst() : files.getLast();
+            if (next.existsAsFile())
+                proc.loadSampleAsync (next);
+            return;
+        }
+        // Built-in sources cycle among themselves.
+        const auto builtIns = sourceChoices.size() - 1;
+        const auto next = ((sourceChoice - 1 + delta) % builtIns + builtIns) % builtIns + 1;
+        auto* p = proc.param (pid::source);
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) next));
+        p->endChangeGesture();
+    }
+
+    void WaveformView::showSampleMenu()
+    {
+        auto& proc = ctx.processor;
+        const auto sample = proc.getUserSample();
+        const auto recentFiles = library::recent();
+        const auto myFiles = library::audioFilesIn (library::userFolder());
+
+        juce::PopupMenu menu, recentMenu, myMenu, builtIns;
+        menu.addItem (1, tr ("Load sample..."));
+        for (int i = 0; i < recentFiles.size(); ++i)
+            recentMenu.addItem (1000 + i, recentFiles[i].getFileName());
+        menu.addSubMenu (tr ("Recent"), recentMenu, ! recentFiles.isEmpty());
+        for (int i = 0; i < juce::jmin (200, myFiles.size()); ++i)
+            myMenu.addItem (2000 + i, myFiles[i].getFileName());
+        if (! myFiles.isEmpty()) myMenu.addSeparator();
+        myMenu.addItem (3, tr ("Open the folder"));
+        menu.addSubMenu (tr ("My samples"), myMenu);
+        for (int c = 1; c < sourceChoices.size(); ++c)
+            builtIns.addItem (3000 + c, tr (sourceChoices[c]), true, sourceChoice == c);
+        menu.addSubMenu (tr ("Built-in sources"), builtIns);
+
+        if (sample != nullptr)
+        {
+            menu.addSeparator();
+            if (sample->detectedNote >= 0.0f)
+            {
+                const auto note = juce::roundToInt (sample->detectedNote);
+                const auto cents = juce::roundToInt ((sample->detectedNote - (float) note) * 100.0f);
+                menu.addItem (4, tr ("Use the sample's pitch as Root") + ": " + noteName (note)
+                                     + (cents != 0 ? " " + juce::String (cents > 0 ? "+" : "") + juce::String (cents) + " ct" : juce::String()));
+            }
+            menu.addItem (5, tr ("Normalize"), true, proc.param (pid::normalize)->getValue() > 0.5f);
+            menu.addItem (6, tr ("Reset region"), regionStart() > 0.0f || regionEnd() < 1.0f);
+            menu.addItem (10, tr ("Keep this sample when switching presets"), true, proc.getKeepSample());
+            if (sample->file.existsAsFile())
+                menu.addItem (7, tr ("Show in Finder"));
+            menu.addItem (8, tr ("Remove sample"));
+        }
+        if (proc.getMissingSamplePath().isNotEmpty())
+            menu.addItem (9, tr ("Find the missing file..."));
+
+        juce::Component::SafePointer<WaveformView> safe (this);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&sampleButton),
+                            [safe, recentFiles, myFiles, sample] (int r)
+                            {
+                                if (safe == nullptr || r == 0)
+                                    return;
+                                auto& p = safe->ctx.processor;
+                                auto setParam = [&p] (const char* id, float normalised)
+                                {
+                                    auto* param = p.param (id);
+                                    param->beginChangeGesture();
+                                    param->setValueNotifyingHost (normalised);
+                                    param->endChangeGesture();
+                                };
+                                if (r == 1 || r == 9)      { if (safe->onLoadRequest) safe->onLoadRequest(); }
+                                else if (r == 3)           library::userFolder().revealToUser();
+                                else if (r == 4)           p.applyDetectedRoot();
+                                else if (r == 5)           setParam (pid::normalize, p.param (pid::normalize)->getValue() > 0.5f ? 0.0f : 1.0f);
+                                else if (r == 6)           { setParam (pid::regionStart, 0.0f); setParam (pid::regionEnd, 1.0f); }
+                                else if (r == 7 && sample) sample->file.revealToUser();
+                                else if (r == 8)           p.clearUserSample();
+                                else if (r == 10)          p.setKeepSample (! p.getKeepSample());
+                                else if (r >= 3000)        setParam (pid::source, p.param (pid::source)->convertTo0to1 ((float) (r - 3000)));
+                                else if (r >= 2000)        p.loadSampleAsync (myFiles[r - 2000]);
+                                else if (r >= 1000)        p.loadSampleAsync (recentFiles[r - 1000]);
                             });
     }
 }

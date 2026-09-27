@@ -23,6 +23,7 @@ namespace thf::grain
 
         void paint (juce::Graphics&) override;
         void resized() override;
+        void mouseDown (const juce::MouseEvent&) override;
 
         bool isInterestedInFileDrag (const juce::StringArray&) override;
         void fileDragEnter (const juce::StringArray&, int, int) override;
@@ -97,6 +98,7 @@ namespace thf::grain
         juce::uint32 focusTime = 0;
         int lastTouchSerial = -1, lastPadSerial = -1;
         juce::String lastLearning;
+        bool standaloneFocusTaken = false;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GrainEditor)
     };

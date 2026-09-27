@@ -10,11 +10,14 @@ namespace thf::grain
     // the parameters; tests fill it directly.
     struct EngineParams
     {
-        float position = 0.25f;     // 0..1 of the source
+        float position = 0.25f;     // 0..1 of the region
+        float regionStart = 0.0f;   // part of the source grains are taken from, 0..1
+        float regionEnd = 1.0f;
+        bool normalizeSource = true; // play user samples at a standard level
         float scan = 0.0f;          // playhead speed, x realtime of the source
         bool perNoteScan = false;
         bool freeze = false;
-        float spray = 0.04f;        // 0..1 of the source, centred on the playhead
+        float spray = 0.04f;        // 0..1 of the region, centred on the playhead
         float sizeMs = 120.0f;
         float density = 24.0f;      // grains per second per voice
         bool sync = false;
@@ -103,7 +106,7 @@ namespace thf::grain
         // Renders and ADDS nothing: overwrites left/right with n samples.
         void render (float* left, float* right, int n, const EngineParams&);
 
-        // Telemetry (audio thread writes, any thread reads).
+        // Telemetry (audio thread writes, any thread reads). The playhead is 0..1 of the region.
         float getPlayhead() const noexcept    { return playheadForUi.load (std::memory_order_relaxed); }
         int getActiveVoices() const noexcept  { return activeVoicesForUi.load (std::memory_order_relaxed); }
         int getActiveGrains() const noexcept  { return activeGrainsForUi.load (std::memory_order_relaxed); }

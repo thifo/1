@@ -71,6 +71,13 @@ namespace thf::grain
         void loadSampleAsync (const juce::File&);
         bool loadSampleSync (const juce::File&, juce::String& error);
         void setUserSample (SourceData::Ptr);
+        void clearUserSample();
+        // When on, switching presets keeps the own sample, its region, Root/Fine and cues.
+        bool getKeepSample() const noexcept         { return keepSample.load(); }
+        void setKeepSample (bool b)                 { keepSample.store (b); }
+        bool isSampleLocked() const;
+        // Root + Fine so the sample plays at its own pitch on its own key. False if unpitched.
+        bool applyDetectedRoot();
         SourceData::Ptr getUserSample() const;
         const SourceData* getFactorySource (int choice) const noexcept { return factory->get (choice); }
         // What the engine plays now (message thread; may be null).
@@ -206,6 +213,7 @@ namespace thf::grain
         std::array<float, 8> cuePressPlayhead {};
 
         std::atomic<bool> scanResetRequested { false };
+        std::atomic<bool> keepSample { true };
         std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
         int64_t samplesProcessed = 0;
         juce::uint32 lastTreeChangeMs = 0;
