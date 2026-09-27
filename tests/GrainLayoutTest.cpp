@@ -42,9 +42,9 @@ public:
                 }
             }
             expect (processor.param (str (layout::mainEncoderParam)) != nullptr);
-            for (auto id : layout::padParams)
-                if (! id.empty())
-                    expect (processor.param (str (id)) != nullptr, str (id));
+            for (const auto& pad : layout::padsBankA)
+                if (! pad.param.empty())
+                    expect (processor.param (str (pad.param)) != nullptr, str (pad.param));
         }
 
         beginTest ("Controller template: CCs are unique");
@@ -71,19 +71,58 @@ public:
                     expectEquals (shown, str (layout::encoderParams[(size_t) page][(size_t) slot]));
 
                     auto* p = processor.param (shown);
-                    p->setValueNotifyingHost (0.5f);
+                    // Choices start at their first entry (the rest of the list is reserved).
+                    p->setValueNotifyingHost (dynamic_cast<juce::AudioParameterChoice*> (p) != nullptr ? 0.0f : 0.5f);
+                    const auto start = p->getValue();
                     juce::MidiBuffer midi;
                     midi.addEvent (juce::MidiMessage::controllerEvent (1, layout::minilab3::encoderCC[(size_t) slot], 66), 0);
                     juce::AudioBuffer<float> buffer (2, 64);
                     processor.processBlock (buffer, midi);
                     processor.flushHardwareChanges();
-                    expect (p->getValue() > 0.5f, "slot " + juce::String (slot + 1) + " on page " + juce::String (page)
+                    expect (p->getValue() > start, "slot " + juce::String (slot + 1) + " on page " + juce::String (page)
                                                   + ": " + juce::String (p->getValue()) + " steps " + juce::String (p->getNumSteps()));
                     expectEquals (processor.getCcFor (shown), layout::minilab3::encoderCC[(size_t) slot]);
                     pump();
                 }
             }
             processor.setPage (0);
+        }
+
+        beginTest ("Pads: note -> action -> label, strips at the far left");
+        {
+            GrainEditor editor (processor);
+            for (int pad = 0; pad < layout::numPads; ++pad)
+            {
+                const auto& slot = layout::padsBankA[(size_t) pad];
+                expect (! slot.label.empty());
+                // The note of pad N (bank A) triggers slot N's action: its parameter moves.
+                if (slot.param.empty()) continue;
+                auto* p = processor.param (str (slot.param));
+                p->setValueNotifyingHost (p->getDefaultValue());
+                const auto before = p->getValue();
+                juce::MidiBuffer midi;
+                midi.addEvent (juce::MidiMessage::noteOn (layout::minilab3::padChannel, layout::minilab3::padBankANote + pad, 1.0f), 0);
+                midi.addEvent (juce::MidiMessage::noteOff (layout::minilab3::padChannel, layout::minilab3::padBankANote + pad), 1);
+                juce::AudioBuffer<float> buffer (2, 64);
+                processor.processBlock (buffer, midi);
+                processor.flushHardwareChanges();
+                expect (std::abs (p->getValue() - before) > 1.0e-4f, "pad " + juce::String (pad + 1) + " " + str (slot.label));
+                pump();
+            }
+            expect (editor.getStripsBounds().getRight() <= editor.getMainKnobBounds().getX());
+        }
+
+        beginTest ("Slot numbers are readable (contrast >= 4.5:1 on the plate)");
+        {
+            auto luminance = [] (juce::Colour c)
+            {
+                auto lin = [] (float v) { return v <= 0.04045f ? v / 12.92f : std::pow ((v + 0.055f) / 1.055f, 2.4f); };
+                return 0.2126f * lin (c.getFloatRed()) + 0.7152f * lin (c.getFloatGreen()) + 0.0722f * lin (c.getFloatBlue());
+            };
+            const auto a = luminance (thf::palette::plate), b = luminance (thf::palette::inkLabel);
+            const auto contrast = (std::max (a, b) + 0.05f) / (std::min (a, b) + 0.05f);
+            logMessage ("  inkLabel on plate: " + juce::String (contrast, 2) + ":1");
+            expect (contrast >= 4.5f);
         }
 
         beginTest ("Geometry mirrors the controller");

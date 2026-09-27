@@ -102,6 +102,9 @@ namespace thf::grain
 
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    // Note name as shown (60 = C3) back to a MIDI note.
+    int parseNote (const juce::String&);
+
     // "C3" style note name, Ableton convention (60 = C3).
     juce::String noteName (int midiNote);
 }

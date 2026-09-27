@@ -89,6 +89,9 @@ namespace thf::grain
     public:
         ControlFader (UiContext&, int slotNumber, const juce::String& paramId, juce::Colour capColour);
         void refresh();
+        // Pickup: while the hardware fader has not reached the value yet, its position is
+        // drawn as a hollow cap. Call from a timer.
+        void refreshPickup();
         void resized() override;
         void paint (juce::Graphics&) override;
         ParamSlider slider;
@@ -99,6 +102,7 @@ namespace thf::grain
         juce::String paramId;
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
         juce::Label name, value;
+        GrainProcessor::PickupState pickup;
     };
 
     //==============================================================================
@@ -112,7 +116,9 @@ namespace thf::grain
         void flash();
         void setColour (juce::Colour c)           { pastel = c; repaint(); }
 
-        std::function<void (const juce::ModifierKeys&)> onClick;
+        // Press and release, like the hardware pad; right-click opens onMenu instead.
+        std::function<void (bool down)> onPress;
+        std::function<void()> onMenu;
 
         void paint (juce::Graphics&) override;
         void mouseDown (const juce::MouseEvent&) override;
@@ -190,7 +196,7 @@ namespace thf::grain
     {
     public:
         explicit DisplayScreen (ThifoLookAndFeel& l) : lookAndFeel (l) {}
-        void setPage (const juce::String& name, int index, int count);
+        void setPage (const juce::String& name, int index, int count, juce::Colour colour);
         void setStatus (const juce::String& param, const juce::String& value, const juce::String& cc);
         void paint (juce::Graphics&) override;
         std::function<void()> onPageClick;
@@ -200,6 +206,7 @@ namespace thf::grain
         ThifoLookAndFeel& lookAndFeel;
         juce::String page, statusParam, statusValue, statusCc;
         int pageIndex = 0, pageCount = 1;
+        juce::Colour pageColour;
     };
 
     //==============================================================================
@@ -221,8 +228,19 @@ namespace thf::grain
             juce::ComboBox box;
             std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> attachment;
         };
+        // Groups shown as columns: a title, choices on top, knobs below.
+        struct Group
+        {
+            juce::String title;
+            std::vector<Choice*> choices;
+            std::vector<ControlKnob*> knobs;
+            juce::Rectangle<int> bounds;
+        };
         std::vector<std::unique_ptr<ControlKnob>> knobs;
         std::vector<std::unique_ptr<Choice>> choices;
+        std::vector<Group> groups;
+        void addChoice (Group&, const char* id);
+        void addKnob (Group&, const char* id);
     };
 
     //==============================================================================

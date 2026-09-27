@@ -95,11 +95,19 @@ namespace thf::grain
         // Restart scanning from Position (thread-safe; applied at the next block).
         void requestScanReset() noexcept            { scanResetRequested.store (true); }
 
-        // Controller page (encoders): 0 engine, 1 tone.
+        // Controller page (encoders): 0 engine, 1 tone, 2 sample.
         int getPage() const noexcept                { return page.load(); }
         void setPage (int p) noexcept               { page.store (juce::jlimit (0, layout::numPages - 1, p)); }
 
-        // Bank A pad function (0-7), same as pressing the hardware pad. Any thread.
+        // A pad pressed or released, from the controller (audio thread) or the screen (message
+        // thread): 0-7 bank A, 8-15 bank B (cues). `now` is in seconds on any steady clock
+        // (press and release come from the same source). Bank A: a tap toggles, holding a
+        // toggle pad makes it momentary. Bank B: tap an empty pad to store, tap to jump,
+        // hold 0.6 s to overwrite; pad held + main encoder click deletes the cue.
+        void pressPad (int pad, bool down, double now);
+        static constexpr double momentaryAfter = 0.3, overwriteAfter = 0.6;
+
+        // Bank A pad function (0-7), as a tap on the pad. Any thread.
         void performPadAction (int pad);
 
         // A/B comparison of parameter sets.
@@ -128,8 +136,20 @@ namespace thf::grain
         int getABSlot() const noexcept              { return abSlot; }
 
         // MIDI settings and learn.
+        // Encoders: the mode is detected from what the controller sends unless one was picked
+        // in the MIDI menu. Both are remembered for every instance (thf.settings).
         midi::EncoderMode getEncoderMode() const noexcept { return (midi::EncoderMode) encoderMode.load(); }
-        void setEncoderMode (midi::EncoderMode m)         { encoderMode.store ((int) m); }
+        void setEncoderMode (midi::EncoderMode m);
+        bool getEncoderAutoDetect() const noexcept  { return encoderAuto.load(); }
+        void setEncoderAutoDetect (bool on);
+        // Hardware position of an absolute control and whether it still has to reach the
+        // parameter's value before it takes over (pickup). hardware < 0: not moved yet.
+        struct PickupState { float hardware = -1.0f; bool waiting = false; };
+        PickupState getPickupState (const juce::String& paramId) const;
+        // MIDI learn ignored this CC (it belongs to the controller template), -1 = none.
+        int getLearnRefusedCc() const noexcept      { return learnRefused.load(); }
+        // Main encoder held and turned: steps through the samples next to the current one.
+        int peekBrowseRequest() const noexcept      { return browseRequest.load(); }
         bool getPadsAsControls() const noexcept     { return padsAsControls.load(); }
         void setPadsAsControls (bool b)             { padsAsControls.store (b); }
         int getPadChannel() const noexcept          { return padChannel.load(); }
@@ -176,7 +196,7 @@ namespace thf::grain
 
         void handleMidi (const juce::MidiMessage&, const EngineParams&);
         bool handleController (int cc, int value);
-        void handlePad (int pad, bool noteOn, float velocity);
+
         void nudgeParam (juce::RangedAudioParameter*, int ticks);
         void setParamFromAudio (juce::RangedAudioParameter*, float normalised);
         void touched (juce::RangedAudioParameter*, int cc);
@@ -253,12 +273,30 @@ namespace thf::grain
         std::atomic<int> padChannel { layout::minilab3::padChannel };
         std::array<std::atomic<int>, 128> learned;     // CC -> parameter index, -1 = none
         std::array<midi::Pickup, 128> pickups;
-        std::array<float, 128> encoderRemainder {};
+        std::array<std::atomic<float>, 128> pickupHardware;
+        std::array<std::atomic<bool>, 128> pickupWaiting;
+        std::atomic<bool> encoderAuto { true }, encoderSettingsDirty { false };
+        midi::EncoderModeDetector encoderDetector;       // audio thread
+        std::atomic<int> learnRefused { -1 };
+
+        // Main encoder (audio thread): acceleration and hold-to-browse.
+        double mainLastTick = -1.0, mainSpeed = 0.0, mainPressTime = 0.0;
+        bool mainHeld = false, mainTurnedWhileHeld = false;
+        std::atomic<int> browseRequest { 0 };
+
+        // Pads: press times, values before a press (momentary), last non-zero amounts.
+        std::array<double, 16> padPressTime {};
+        std::array<juce::RangedAudioParameter*, 8> padParams {};   // bank A, cached (no lookups on audio)
+        std::array<float, 8> padValueBefore {};
+        std::array<float, 8> padLastAmount { 1, 1, 1, 1, 1, 1, 1, 1 };
+        std::atomic<int> cueHeld { -1 };
+        std::array<bool, 8> cueDeleted {};
+        double clockSeconds() const noexcept { return (double) samplesProcessed / hostSampleRate.load(); }
+        void browseSamples (int delta);
         std::atomic<int> learnTarget { -1 };
         std::atomic<int> lastTouchedParam { -1 }, lastTouchedSerial { 0 };
         std::atomic<float> pitchStrip { 0.5f }, modStrip { 0.0f };
         std::atomic<int> lastPad { -1 }, lastPadSerial { 0 };
-        std::array<int64_t, 8> cuePressTime {};
         std::array<float, 8> cuePressPlayhead {};
 
         std::atomic<bool> scanResetRequested { false };

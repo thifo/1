@@ -20,6 +20,16 @@ namespace thf::grain::library
             o.storageFormat = juce::PropertiesFile::storeAsXML;
             return o;
         }
+
+        // The settings file; tests point THF_SETTINGS_FILE elsewhere so they never touch the
+        // user's own recent list and preferences.
+        std::unique_ptr<juce::PropertiesFile> openSettings()
+        {
+            const auto overridePath = juce::SystemStats::getEnvironmentVariable ("THF_SETTINGS_FILE", {});
+            if (overridePath.isNotEmpty() && juce::File::isAbsolutePath (overridePath))
+                return std::make_unique<juce::PropertiesFile> (juce::File (overridePath), settingsOptions());
+            return std::make_unique<juce::PropertiesFile> (settingsOptions());
+        }
     }
 
     juce::File userFolder()
@@ -60,9 +70,9 @@ namespace thf::grain::library
 
     juce::Array<juce::File> recent()
     {
-        juce::PropertiesFile settings (settingsOptions());
+        auto settings = openSettings();
         juce::Array<juce::File> files;
-        for (const auto& path : juce::StringArray::fromLines (settings.getValue (recentKey)))
+        for (const auto& path : juce::StringArray::fromLines (settings->getValue (recentKey)))
             if (path.isNotEmpty() && juce::File::isAbsolutePath (path) && isAudioFile (juce::File (path)))
                 files.add (juce::File (path));
         return files;
@@ -77,9 +87,9 @@ namespace thf::grain::library
         for (const auto& f : recent())
             if (f != file && paths.size() < maxRecent)
                 paths.add (f.getFullPathName());
-        juce::PropertiesFile settings (settingsOptions());
-        settings.setValue (recentKey, paths.joinIntoString ("\n"));
-        settings.saveIfNeeded();
+        auto settings = openSettings();
+        settings->setValue (recentKey, paths.joinIntoString ("\n"));
+        settings->saveIfNeeded();
     }
 
     juce::File findMissing (const juce::File& original)
@@ -99,5 +109,17 @@ namespace thf::grain::library
             if (const auto candidate = folder.getChildFile (name); isAudioFile (candidate))
                 return candidate;
         return {};
+    }
+
+    juce::String readSetting (const juce::String& key)
+    {
+        return openSettings()->getValue (key);
+    }
+
+    void writeSetting (const juce::String& key, const juce::String& value)
+    {
+        auto settings = openSettings();
+        settings->setValue (key, value);
+        settings->saveIfNeeded();
     }
 }

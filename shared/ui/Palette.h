@@ -15,6 +15,8 @@ namespace thf::palette
     inline const juce::Colour ink          { 0xff1d2025 };
     inline const juce::Colour inkDim       { 0xff6c727a };
     inline const juce::Colour inkFaint     { 0xffa3a8ae };
+    // Small functional text on the plate (slot numbers, secondary values): >= 4.5:1.
+    inline const juce::Colour inkLabel     { 0xff5a6068 };
 
     // Glass: dark screens.
     inline const juce::Colour glass        { 0xff111316 };

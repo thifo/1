@@ -6,7 +6,7 @@ namespace thf::grain
 {
     // The main glass screen: source waveform, region, playhead, spray range, live grains and
     // cues, plus the sample bar (< Sample >). Drag = Position (x) and Spray (y), drag the
-    // region handles = Sample Start / End, wheel = Size, shift-wheel = Spray.
+    // region handles = Sample Start / End, Cmd-wheel = Size, Shift-wheel = Spray.
     class WaveformView : public juce::Component
     {
     public:
@@ -39,6 +39,8 @@ namespace thf::grain
 
         enum class Drag { none, position, regionStart, regionEnd };
         Drag drag = Drag::none;
+        enum class Axis { undecided, position, spray };
+        Axis axis = Axis::undecided;
         juce::TextButton prevSample { "<" }, sampleButton, nextSample { ">" };
 
         UiContext& ctx;

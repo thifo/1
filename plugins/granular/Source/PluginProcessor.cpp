@@ -101,6 +101,20 @@ namespace thf::grain
 
         for (auto& c : cues) c.store (-1.0f);
         for (auto& l : learned) l.store (-1);
+        for (size_t i = 0; i < padParams.size(); ++i)
+            if (const auto id = layout::padsBankA[i].param; ! id.empty())
+                padParams[i] = param (juce::String (std::string (id)));
+        for (auto& h : pickupHardware) h.store (-1.0f);
+        for (auto& w : pickupWaiting) w.store (false);
+        // Encoder mode: remembered for every instance.
+        {
+            const auto saved = library::readSetting ("grainEncoderMode");
+            if (saved.isNotEmpty())
+            {
+                encoderAuto.store (saved.startsWith ("auto"));
+                encoderMode.store (juce::jlimit (0, 3, saved.fromLastOccurrenceOf (":", false, false).getIntValue()));
+            }
+        }
 
         const auto count = params.size();
         pendingHardware.reset (new std::atomic<float>[count]);
@@ -315,12 +329,12 @@ namespace thf::grain
                 using namespace layout::minilab3;
                 if (note >= padBankANote && note < padBankANote + layout::numPads)
                 {
-                    handlePad (note - padBankANote, m.isNoteOn(), m.getFloatVelocity());
+                    pressPad (note - padBankANote, m.isNoteOn(), clockSeconds());
                     return;
                 }
                 if (note >= padBankBNote && note < padBankBNote + layout::numPads)
                 {
-                    handlePad (layout::numPads + note - padBankBNote, m.isNoteOn(), m.getFloatVelocity());
+                    pressPad (layout::numPads + note - padBankBNote, m.isNoteOn(), clockSeconds());
                     return;
                 }
             }
@@ -444,7 +458,15 @@ namespace thf::grain
         else if (p->isDiscrete())
             steps = p->getNumSteps();
 
-        if (steps > 1 && steps <= 200)
+        if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (p))
+        {
+            // Only the real entries (the list is padded for future ones).
+            int real = 0;
+            while (real < choice->choices.size() && choice->choices[real] != reservedChoiceName) ++real;
+            const auto index = juce::roundToInt (p->convertFrom0to1 (currentValue (p)));
+            setParamFromAudio (p, p->convertTo0to1 ((float) juce::jlimit (0, juce::jmax (0, real - 1), index + ticks)));
+        }
+        else if (steps > 1 && steps <= 200)
             setParamFromAudio (p, currentValue (p) + (float) ticks / (float) (steps - 1));
         else
             setParamFromAudio (p, currentValue (p) + (float) ticks * 0.005f);
@@ -458,6 +480,14 @@ namespace thf::grain
         // MIDI learn takes the next CC.
         if (const auto target = learnTarget.load(); target >= 0)
         {
+            // The template's own controls keep what the screen shows; bank select and
+            // channel mode messages are not controls.
+            if (layout::isReservedForLearn (cc))
+            {
+                learnRefused.store (cc);
+                return true;
+            }
+            learnRefused.store (-1);
             for (auto& l : learned)
             {
                 auto expected = target;
@@ -470,11 +500,24 @@ namespace thf::grain
             return true;
         }
 
-        const auto mode = getEncoderMode();
         auto isTemplateEncoder = [&]
         {
             for (auto e : encoderCC) if (e == cc) return true;
-            return cc == mainEncoderCC;
+            return false;
+        };
+        if (encoderAuto.load() && isTemplateEncoder() && encoderDetector.feed (value))
+        {
+            encoderMode.store ((int) encoderDetector.getMode());
+            encoderSettingsDirty.store (true);
+        }
+        const auto mode = getEncoderMode();
+        auto applyAbsolute = [&] (juce::RangedAudioParameter* p)
+        {
+            const auto engaged = pickups[(size_t) cc].process (normalised, currentValue (p));
+            pickupHardware[(size_t) cc].store (normalised);
+            pickupWaiting[(size_t) cc].store (! engaged);
+            if (engaged)
+                setParamFromAudio (p, normalised);
         };
 
         if (const auto index = learned[(size_t) cc].load(); index >= 0 && index < (int) params.size())
@@ -482,8 +525,8 @@ namespace thf::grain
             auto* p = params[(size_t) index];
             if (isTemplateEncoder() && mode != midi::EncoderMode::absolute)
                 nudgeParam (p, midi::decodeRelative (value, mode));
-            else if (pickups[(size_t) cc].process (normalised, currentValue (p)))
-                setParamFromAudio (p, normalised);
+            else
+                applyAbsolute (p);
             touched (p, cc);
             return true;
         }
@@ -494,10 +537,7 @@ namespace thf::grain
                 continue;
             auto* p = encoderSlots[(size_t) page.load()][(size_t) slot];
             if (mode == midi::EncoderMode::absolute)
-            {
-                if (pickups[(size_t) cc].process (normalised, currentValue (p)))
-                    setParamFromAudio (p, normalised);
-            }
+                applyAbsolute (p);
             else
             {
                 nudgeParam (p, midi::decodeRelative (value, mode));
@@ -511,26 +551,65 @@ namespace thf::grain
             if (faderCC[(size_t) slot] != cc)
                 continue;
             auto* p = faderSlots[(size_t) slot];
-            if (pickups[(size_t) cc].process (normalised, currentValue (p)))
-                setParamFromAudio (p, normalised);
+            applyAbsolute (p);
             touched (p, cc);
             return true;
         }
 
         if (cc == mainEncoderCC)
         {
-            // Fine position: 0.2 % per tick; the encoder accelerates by itself.
-            auto* p = mainEncoderSlot;
             const auto ticks = midi::decodeRelative (value, midi::EncoderMode::binaryOffset);
-            setParamFromAudio (p, currentValue (p) + (float) ticks * 0.002f);
+            if (mainHeld)
+            {
+                // Held: step through the samples next to the current one.
+                browseRequest.fetch_add (ticks);
+                mainTurnedWhileHeld = true;
+                return true;
+            }
+            // Position: 0.1 % of the region per tick when turned slowly, up to 2 % when spun.
+            const auto now = clockSeconds();
+            if (mainLastTick >= 0.0 && now - mainLastTick < 0.3)
+            {
+                const auto rate = std::abs (ticks) / juce::jmax (1.0e-3, now - mainLastTick);
+                mainSpeed = 0.6 * mainSpeed + 0.4 * rate;
+            }
+            else
+            {
+                mainSpeed = 0.0;
+            }
+            mainLastTick = now;
+            const auto acceleration = juce::jlimit (1.0, 20.0, 1.0 + std::pow (juce::jmax (0.0, mainSpeed - 8.0) / 12.0, 1.5));
+            auto* p = mainEncoderSlot;
+            setParamFromAudio (p, currentValue (p) + (float) (ticks * 0.001 * acceleration));
             touched (p, cc);
             return true;
         }
 
         if (cc == mainClickCC)
         {
+            const auto now = clockSeconds();
             if (value >= 64)
-                page.store ((page.load() + 1) % layout::numPages);
+            {
+                if (mainHeld && ! mainTurnedWhileHeld)                 // no release came: that was a click
+                    page.store ((page.load() + 1) % layout::numPages);
+                mainHeld = true;
+                mainTurnedWhileHeld = false;
+                mainPressTime = now;
+                // A cue pad held down + click deletes that cue.
+                if (const auto cue = cueHeld.load(); cue >= 0)
+                {
+                    cues[(size_t) cue].store (-1.0f);
+                    cueDeleted[(size_t) cue] = true;
+                    mainTurnedWhileHeld = true;
+                }
+            }
+            else
+            {
+                // A short click without turning changes the page.
+                if (mainHeld && ! mainTurnedWhileHeld && now - mainPressTime < 0.4)
+                    page.store ((page.load() + 1) % layout::numPages);
+                mainHeld = false;
+            }
             return true;
         }
 
@@ -549,9 +628,11 @@ namespace thf::grain
         return false;
     }
 
-    void GrainProcessor::handlePad (int pad, bool noteOn, float)
+    void GrainProcessor::pressPad (int pad, bool down, double now)
     {
-        if (noteOn)
+        if (pad < 0 || pad >= 2 * layout::numPads)
+            return;
+        if (down)
         {
             lastPad.store (pad);
             lastPadSerial.fetch_add (1);
@@ -561,13 +642,15 @@ namespace thf::grain
         {
             // Bank B: cues. Empty pad: store on release. Filled pad: jump on press; holding
             // for 0.6 s overwrites it with the position the playhead had before the jump.
-            const auto i = pad - layout::numPads;
+            const auto i = (size_t) (pad - layout::numPads);
             auto* position = positionParam;
-            if (noteOn)
+            if (down)
             {
-                cuePressTime[(size_t) i] = samplesProcessed;
-                cuePressPlayhead[(size_t) i] = engine.getPlayhead();
-                if (const auto cue = cues[(size_t) i].load(); cue >= 0.0f)
+                padPressTime[(size_t) pad] = now;
+                cuePressPlayhead[i] = engine.getPlayhead();
+                cueDeleted[i] = false;
+                cueHeld.store ((int) i);
+                if (const auto cue = cues[i].load(); cue >= 0.0f)
                 {
                     setParamFromAudio (position, cue);
                     engine.resetScan();
@@ -575,12 +658,15 @@ namespace thf::grain
             }
             else
             {
-                const bool empty = cues[(size_t) i].load() < 0.0f;
-                const bool longPress = (double) (samplesProcessed - cuePressTime[(size_t) i]) > 0.6 * hostSampleRate;
+                cueHeld.store (-1);
+                if (cueDeleted[i])
+                    return;
+                const bool empty = cues[i].load() < 0.0f;
+                const bool longPress = now - padPressTime[(size_t) pad] >= overwriteAfter;
                 if (empty || longPress)
                 {
-                    const auto where = cuePressPlayhead[(size_t) i];
-                    cues[(size_t) i].store (where);
+                    const auto where = cuePressPlayhead[i];
+                    cues[i].store (where);
                     setParamFromAudio (position, where);
                     engine.resetScan();
                 }
@@ -588,16 +674,45 @@ namespace thf::grain
             return;
         }
 
-        if (noteOn)
+        const auto& slot = layout::padsBankA[(size_t) pad];
+        auto* p = padParams[(size_t) pad];
+        if (down)
+        {
+            padPressTime[(size_t) pad] = now;
+            if (p != nullptr) padValueBefore[(size_t) pad] = currentValue (p);
             performPadAction (pad);
+        }
+        else if (slot.momentary && p != nullptr && now - padPressTime[(size_t) pad] >= momentaryAfter)
+        {
+            // Held: the pad was momentary, back to where it was.
+            setParamFromAudio (p, padValueBefore[(size_t) pad]);
+            touched (p, -1);
+        }
     }
 
     void GrainProcessor::performPadAction (int pad)
     {
+        pad = juce::jlimit (0, layout::numPads - 1, pad);
         auto toggle = [this] (const char* id)
         {
             auto* p = param (id);
             setParamFromAudio (p, currentValue (p) > 0.5f ? 0.0f : 1.0f);
+            touched (p, -1);
+        };
+        // Amounts switch between 0 and the last value that was not 0 (the knob setting).
+        auto toggleAmount = [this, pad] (const char* id)
+        {
+            auto* p = param (id);
+            const auto v = currentValue (p);
+            if (v > 1.0e-4f)
+            {
+                padLastAmount[(size_t) pad] = v;
+                setParamFromAudio (p, 0.0f);
+            }
+            else
+            {
+                setParamFromAudio (p, padLastAmount[(size_t) pad]);
+            }
             touched (p, -1);
         };
         // Cycles through the real entries only (the lists are longer, see reservedChoices).
@@ -609,24 +724,50 @@ namespace thf::grain
             touched (p, -1);
         };
 
-        switch (layout::padsBankA[(size_t) juce::jlimit (0, layout::numPads - 1, pad)])
+        switch (layout::padsBankA[(size_t) pad].action)
         {
             case layout::PadAction::freeze:         toggle (pid::freeze); break;
-            case layout::PadAction::hold:           toggle (pid::hold); break;
-            case layout::PadAction::reverse:        toggle (pid::reverse); break;
+            case layout::PadAction::link:           toggle (pid::linkVoices); break;
+            case layout::PadAction::reverse:        toggleAmount (pid::reverse); break;
+            case layout::PadAction::window:         toggleAmount (pid::window); break;
             case layout::PadAction::sync:           toggle (pid::sync); break;
             case layout::PadAction::filterCycle:    cycle (pid::filterType, filterChoices.size()); break;
             case layout::PadAction::voiceModeCycle: cycle (pid::voiceMode, voiceModeChoices.size()); break;
             case layout::PadAction::abToggle:       abRequested.store (true); break;
-            case layout::PadAction::windowCycle:
-            {
-                auto* p = param (pid::window);
-                const auto v = currentValue (p);
-                setParamFromAudio (p, v < 0.25f ? 0.5f : (v < 0.75f ? 1.0f : 0.0f));
-                touched (p, -1);
-                break;
-            }
         }
+    }
+
+    void GrainProcessor::setEncoderMode (midi::EncoderMode m)
+    {
+        encoderMode.store ((int) m);
+        encoderAuto.store (false);
+        encoderSettingsDirty.store (true);
+    }
+
+    void GrainProcessor::setEncoderAutoDetect (bool on)
+    {
+        encoderAuto.store (on);
+        encoderSettingsDirty.store (true);
+    }
+
+    GrainProcessor::PickupState GrainProcessor::getPickupState (const juce::String& paramId) const
+    {
+        const auto cc = getCcFor (paramId);
+        if (cc < 0)
+            return {};
+        return { pickupHardware[(size_t) cc].load(), pickupWaiting[(size_t) cc].load() };
+    }
+
+    void GrainProcessor::browseSamples (int delta)
+    {
+        // Next/previous audio file in the folder of the current sample (or the user's sample
+        // folder when a built-in source plays).
+        const auto current = getUserSample();
+        const auto from = current != nullptr && current->file.existsAsFile() ? current->file
+                                                                             : library::userFolder().getChildFile ("-");
+        const auto next = library::neighbour (from, delta);
+        if (next.existsAsFile())
+            loadSampleAsync (next);
     }
 
     void GrainProcessor::jumpToCue (int index)
@@ -1031,6 +1172,13 @@ namespace thf::grain
     {
         flushHardwareChanges();
 
+        if (const auto steps = browseRequest.exchange (0); steps != 0)
+            browseSamples (steps);
+
+        if (encoderSettingsDirty.exchange (false))
+            library::writeSetting ("grainEncoderMode", juce::String (encoderAuto.load() ? "auto:" : "manual:")
+                                                           + juce::String (encoderMode.load()));
+
         if (abRequested.exchange (false))
             toggleAB();
 
@@ -1163,7 +1311,6 @@ namespace thf::grain
         const auto midiTree = extra.getChildWithName ("Midi");
         if (includeMidi && midiTree.isValid())
         {
-            encoderMode.store (juce::jlimit (0, 3, (int) midiTree.getProperty ("encoderMode", 0)));
             padsAsControls.store ((bool) midiTree.getProperty ("padsAsControls", true));
             padChannel.store (juce::jlimit (1, 16, (int) midiTree.getProperty ("padChannel", layout::minilab3::padChannel)));
             page.store (juce::jlimit (0, layout::numPages - 1, (int) midiTree.getProperty ("page", 0)));

@@ -24,6 +24,7 @@ namespace thf::grain
         void paint (juce::Graphics&) override;
         void resized() override;
         void mouseDown (const juce::MouseEvent&) override;
+        bool keyPressed (const juce::KeyPress&) override;
 
         bool isInterestedInFileDrag (const juce::StringArray&) override;
         void fileDragEnter (const juce::StringArray&, int, int) override;
@@ -37,6 +38,7 @@ namespace thf::grain
         juce::Rectangle<int> getPadBounds (int slot) const { return pads[(size_t) slot]->getBounds(); }
         juce::Rectangle<int> getMainKnobBounds() const { return mainKnob.getBounds(); }
         juce::Rectangle<int> getKeyboardBounds() const { return keyboard.getBounds(); }
+        juce::Rectangle<int> getStripsBounds() const { return pitchStrip.getBounds().getUnion (modStrip.getBounds()); }
         PlayKeyboard& getKeyboard() noexcept { return keyboard; }
         void showSettings (bool);
         void showHelp (bool);
@@ -62,7 +64,8 @@ namespace thf::grain
         void showPresetMenu();
         void showMidiMenu();
         void chooseSample();
-        void padClicked (int index, const juce::ModifierKeys&);
+        void padPressed (int index, bool down);
+        void showCueMenu (int index);
         void keepKeyboardFocus();
 
         GrainProcessor& processor;
@@ -82,7 +85,7 @@ namespace thf::grain
         std::array<std::unique_ptr<ControlKnob>, layout::numEncoders> encoders;
         std::array<std::unique_ptr<ControlFader>, layout::numFaders> faders;
         std::array<std::unique_ptr<PadButton>, layout::numPads> pads;
-        juce::TextButton bankA { "A" }, bankB { "B" };
+        juce::TextButton bankA, bankB;
         PlayKeyboard keyboard;
         MeterView meter;
         juce::TextButton hqButton { "HQ" }, clipButton, midiButton { "MIDI" };
@@ -97,6 +100,7 @@ namespace thf::grain
         juce::String focusedParam;
         juce::uint32 focusTime = 0;
         int lastTouchSerial = -1, lastPadSerial = -1;
+        int focusedPad = -1;          // pad shown in the status line (0-15), -1 = a parameter
         juce::String lastLearning;
         bool standaloneFocusTaken = false;
 

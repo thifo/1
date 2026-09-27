@@ -25,7 +25,13 @@ namespace thf::grain
         const juce::Colour padColours[] = { padBlue, padTeal, padGreen, padYellow, padSalmon, padGrey, padPink, padCream };
         const juce::Colour faderColours[] = { accentTeal, accentGreen, accentYellow, accentOrange };
 
-        juce::Colour pageColour (int page) { return page == 0 ? knobArc : accentOrange; }
+        juce::Colour pageColour (int page)
+        {
+            const juce::Colour colours[] = { knobArc, accentOrange, accentGreen };
+            return colours[juce::jlimit (0, 2, page)];
+        }
+
+        juce::String utf8 (const char* s) { return juce::String::fromUTF8 (s); }
 
         juce::String str (std::string_view s) { return juce::String (std::string (s)); }
 
@@ -127,7 +133,8 @@ namespace thf::grain
         for (int i = 0; i < layout::numPads; ++i)
         {
             pads[(size_t) i] = std::make_unique<PadButton> (padColours[i]);
-            pads[(size_t) i]->onClick = [this, i] (const juce::ModifierKeys& m) { padClicked (i, m); };
+            pads[(size_t) i]->onPress = [this, i] (bool down) { padPressed (i, down); };
+            pads[(size_t) i]->onMenu = [this, i] { if (padBank == 1) showCueMenu (i); };
             content.addAndMakeVisible (*pads[(size_t) i]);
         }
         for (auto* b : { &bankA, &bankB })
@@ -165,11 +172,12 @@ namespace thf::grain
         setResizable (true, true);
         if (auto* c = getConstrainer())
             c->setFixedAspectRatio ((double) designWidth / designHeight);
-        setResizeLimits (designWidth * 6 / 10, designHeight * 6 / 10, designWidth * 16 / 10, designHeight * 16 / 10);
-        // Start at full size if it fits the screen, otherwise scaled down (laptops).
+        setResizeLimits (designWidth * 3 / 4, designHeight * 3 / 4, designWidth * 16 / 10, designHeight * 16 / 10);
+        // Start at full size if it fits the screen, otherwise scaled down (laptops), never so
+        // small that the text becomes hard to read.
         auto scale = 1.0;
         if (const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
-            scale = juce::jlimit (0.6, 1.0, (display->userBounds.getHeight() - 90) / (double) designHeight);
+            scale = juce::jlimit (0.75, 1.0, (display->userBounds.getHeight() - 90) / (double) designHeight);
         setSize (juce::roundToInt (designWidth * scale), juce::roundToInt (designHeight * scale));
         keepKeyboardFocus();
         startTimerHz (30);
@@ -194,6 +202,18 @@ namespace thf::grain
         noFocus (content);
         setWantsKeyboardFocus (false);
         content.addMouseListener (this, true);
+    }
+
+    bool GrainEditor::keyPressed (const juce::KeyPress& key)
+    {
+        // Cmd+Z / Shift+Cmd+Z: the plug-in's own undo while its window has the keys.
+        if (key.getModifiers().isCommandDown() && key.getKeyCode() == 'Z')
+        {
+            if (key.getModifiers().isShiftDown()) processor.getUndoManager().redo();
+            else                                  processor.getUndoManager().undo();
+            return true;
+        }
+        return false;
     }
 
     void GrainEditor::mouseDown (const juce::MouseEvent&)
@@ -313,8 +333,10 @@ namespace thf::grain
 
         g.setFont (lookAndFeel.font (12.0f));
         g.setColour (inkDim);
-        g.drawText (tr ("Pitch"), pitchStrip.getX() - 8, pitchStrip.getBottom() + 4, pitchStrip.getWidth() + 16, 16, juce::Justification::centred);
-        g.drawText (tr ("Mod"), modStrip.getX() - 8, modStrip.getBottom() + 4, modStrip.getWidth() + 16, 16, juce::Justification::centred);
+        g.setColour (inkLabel);
+        g.setFont (lookAndFeel.font (12.5f, true));
+        g.drawText (tr ("Bend"), pitchStrip.getX() - 10, pitchStrip.getBottom() + 4, pitchStrip.getWidth() + 20, 16, juce::Justification::centred);
+        g.drawText (tr ("Mod"), modStrip.getX() - 10, modStrip.getBottom() + 4, modStrip.getWidth() + 20, 16, juce::Justification::centred);
 
         // Output readout next to the meter.
         g.setColour (inkDim);
@@ -349,7 +371,9 @@ namespace thf::grain
     {
         const bool russian = Translator::get().getLanguage() == Translator::Language::russian;
         langButton.setButtonText (russian ? "RU" : "EN");
-        learnButton.setButtonText (tr ("Learn"));
+        learnButton.setButtonText (tr ("MIDI Learn"));
+        bankA.setButtonText (tr ("Play"));
+        bankB.setButtonText (tr ("Cues"));
         moreButton.setButtonText (tr ("More"));
         clipButton.setButtonText (tr ("Safe Clip"));
         presetName.setButtonText (processor.getPresets().getCurrentName());
@@ -374,7 +398,7 @@ namespace thf::grain
         shownPage = page;
         for (int i = 0; i < layout::numEncoders; ++i)
             encoders[(size_t) i]->attach (str (layout::encoderParams[(size_t) page][(size_t) i]), pageColour (page));
-        screen.setPage (tr (str (layout::pageNames[(size_t) page])), page, layout::numPages);
+        screen.setPage (tr (str (layout::pageNames[(size_t) page])), page, layout::numPages, pageColour (page));
     }
 
     void GrainEditor::setPadBank (int bank)
@@ -387,8 +411,8 @@ namespace thf::grain
 
     void GrainEditor::refreshPads()
     {
-        auto value = [this] (const char* id) { return processor.param (id)->getValue(); };
-        auto text = [this] (const char* id) { return processor.param (id)->getCurrentValueAsText(); };
+        auto value = [this] (std::string_view id) { return processor.param (str (id))->getValue(); };
+        auto text = [this] (const char* id) { return tr (processor.param (id)->getCurrentValueAsText()); };
 
         for (int i = 0; i < layout::numPads; ++i)
         {
@@ -403,57 +427,69 @@ namespace thf::grain
                 continue;
             }
 
+            const auto& slot = layout::padsBankA[(size_t) i];
             pad.setColour (padColours[i]);
-            pad.setLabel (tr (str (layout::padLabels[(size_t) i])));
-            switch (layout::padsBankA[(size_t) i])
+            pad.setLabel (tr (str (slot.label)));
+            switch (slot.action)
             {
-                case layout::PadAction::freeze:  pad.setLit (value (pid::freeze) > 0.5f); pad.setSubLabel ({}); break;
-                case layout::PadAction::hold:    pad.setLit (value (pid::hold) > 0.5f); pad.setSubLabel ({}); break;
-                case layout::PadAction::reverse: pad.setLit (value (pid::reverse) > 0.5f); pad.setSubLabel (text (pid::reverse)); break;
-                case layout::PadAction::windowCycle:
-                {
-                    const auto w = value (pid::window);
-                    pad.setLit (w > 0.01f);
-                    pad.setSubLabel (w < 0.25f ? "Hann" : (w < 0.75f ? "Tukey" : "Flat"));
+                case layout::PadAction::freeze:
+                case layout::PadAction::link:
+                    pad.setLit (value (slot.param) > 0.5f); pad.setSubLabel ({}); break;
+                case layout::PadAction::reverse:
+                case layout::PadAction::window:
+                    // The pad switches between 0 and the knob's own setting: show that value.
+                    pad.setLit (value (slot.param) > 1.0e-4f);
+                    pad.setSubLabel (processor.param (str (slot.param))->getCurrentValueAsText());
                     break;
-                }
-                case layout::PadAction::sync:    pad.setLit (value (pid::sync) > 0.5f); pad.setSubLabel (text (pid::syncRate)); break;
+                case layout::PadAction::sync:
+                    pad.setLit (value (slot.param) > 0.5f); pad.setSubLabel (text (pid::syncRate)); break;
                 case layout::PadAction::filterCycle:
-                    pad.setLit (value (pid::filterType) > 0.01f); pad.setSubLabel (text (pid::filterType)); break;
+                    pad.setLit (value (slot.param) > 0.01f); pad.setSubLabel (text (pid::filterType)); break;
                 case layout::PadAction::voiceModeCycle:
-                    pad.setLit (value (pid::voiceMode) > 0.01f); pad.setSubLabel (text (pid::voiceMode)); break;
+                    pad.setLit (value (slot.param) > 0.01f); pad.setSubLabel (text (pid::voiceMode)); break;
                 case layout::PadAction::abToggle:
-                    pad.setLabel (processor.getABSlot() == 0 ? "A" : "B");
+                    pad.setLabel (utf8 ("A\xc2\xb7" "B"));
                     pad.setLit (processor.getABSlot() == 1);
-                    pad.setSubLabel ({});
+                    pad.setSubLabel (processor.getABSlot() == 0 ? "A" : "B");
                     break;
             }
         }
     }
 
-    void GrainEditor::padClicked (int index, const juce::ModifierKeys& mods)
+    void GrainEditor::padPressed (int index, bool down)
     {
-        if (padBank == 1)
+        const auto pad = index + (padBank == 1 ? layout::numPads : 0);
+        if (down)
         {
-            if (mods.isAltDown())
-                processor.setCue (index, -1.0f);
-            else if (mods.isShiftDown() || mods.isPopupMenu() || processor.getCue (index) < 0.0f)
-                processor.setCue (index, processor.getEngine().getPlayhead());
-            else
-                processor.jumpToCue (index);
-            refreshPads();
-            return;
+            processor.getUndoManager().beginNewTransaction();
+            focusedPad = pad;
+            focusTime = juce::Time::getMillisecondCounter();
         }
-        processor.getUndoManager().beginNewTransaction();
-        if (layout::padsBankA[(size_t) index] == layout::PadAction::abToggle)
-            processor.toggleAB();
-        else
-            processor.performPadAction (index);
+        processor.pressPad (pad, down, juce::Time::getMillisecondCounterHiRes() * 0.001);
+        if (! down && padBank == 0 && layout::padsBankA[(size_t) index].action == layout::PadAction::abToggle)
+            return;
         refreshPads();
+        updateStatus();
+    }
+
+    void GrainEditor::showCueMenu (int index)
+    {
+        juce::PopupMenu menu;
+        menu.addSectionHeader (tr ("Cue") + " " + juce::String (index + 1));
+        menu.addItem (1, tr ("Store the playhead here"));
+        menu.addItem (2, tr ("Delete cue"), processor.getCue (index) >= 0.0f);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (pads[(size_t) index].get()), [this, index] (int r)
+        {
+            processor.getUndoManager().beginNewTransaction();
+            if (r == 1) processor.setCue (index, processor.getEngine().getPlayhead());
+            if (r == 2) processor.setCue (index, -1.0f);
+            refreshPads();
+        });
     }
 
     void GrainEditor::focusParam (const juce::String& id)
     {
+        focusedPad = -1;
         focusedParam = id;
         focusTime = juce::Time::getMillisecondCounter();
         updateStatus();
@@ -464,20 +500,61 @@ namespace thf::grain
         if (processor.isLearning())
         {
             auto* p = processor.param (processor.getLearningParam());
-            screen.setStatus (tr ("MIDI Learn"), p != nullptr ? p->getName (32) : juce::String(), tr ("move a control on the controller"));
+            const auto refused = processor.getLearnRefusedCc();
+            screen.setStatus (tr ("MIDI Learn"), p != nullptr ? p->getName (32) : juce::String(),
+                              refused >= 0 ? "CC " + juce::String (refused) + ": " + tr ("used by the controller template")
+                                           : tr ("move a control on the controller"));
             return;
         }
+
+        if (focusedPad >= 0)
+        {
+            // Pad: which one, what it does now, and the note that plays it.
+            const auto cueBank = focusedPad >= layout::numPads;
+            const auto index = focusedPad % layout::numPads;
+            const auto note = (cueBank ? layout::minilab3::padBankBNote : layout::minilab3::padBankANote) + index;
+            const auto what = cueBank ? tr ("Cue") + " " + juce::String (index + 1)
+                                      : tr (str (layout::padsBankA[(size_t) index].label));
+            screen.setStatus (tr ("Pad") + " " + juce::String (index + 1) + sep() + (cueBank ? tr ("Cues") : tr ("Play")), what,
+                              tr ("note") + " " + juce::String (note) + sep() + tr ("channel") + " " + juce::String (processor.getPadChannel()));
+            return;
+        }
+
         auto* p = processor.param (focusedParam);
         if (p == nullptr)
         {
             screen.setStatus ({}, {}, {});
             return;
         }
+        auto valueText = tr (p->getCurrentValueAsText());
+
+        // Spray also in milliseconds of the current sample.
+        if (focusedParam == pid::spray)
+            if (const auto s = processor.getCurrentSourceForDisplay())
+            {
+                const auto region = std::abs (processor.param (pid::regionEnd)->getValue() - processor.param (pid::regionStart)->getValue());
+                const auto ms = p->getValue() * region * s->getDurationSeconds() * 1000.0;
+                valueText << sep() << juce::String (juce::roundToInt (ms)) << " ms";
+            }
+
         const auto cc = processor.getCcFor (focusedParam);
         juce::String ccText = cc >= 0 ? "CC " + juce::String (cc) : tr ("no CC");
         if (processor.isLearned (focusedParam))
             ccText << sep() << tr ("learned");
-        screen.setStatus (p->getName (32), p->getCurrentValueAsText(), ccText);
+
+        // Where modulation goes.
+        const auto target = [this] (const char* id) { return tr (processor.param (id)->getCurrentValueAsText()); };
+        if (focusedParam == pid::lfoDepth || focusedParam == pid::lfoRate || focusedParam == pid::lfoShape)
+            ccText = utf8 ("\xe2\x86\x92 ") + target (pid::lfoTarget) + sep() + ccText;
+        if (focusedParam == pid::modDepth)
+            ccText = utf8 ("\xe2\x86\x92 ") + target (pid::modTarget) + sep() + ccText;
+
+        // Pickup: the hardware control is not there yet; the arrow says which way to move it.
+        if (const auto pickup = processor.getPickupState (focusedParam); pickup.waiting && pickup.hardware >= 0.0f)
+            ccText = utf8 (pickup.hardware < p->getValue() ? "\xe2\x96\xb2 " : "\xe2\x96\xbc ")
+                     + juce::String (juce::roundToInt (pickup.hardware * 100.0f)) + " %" + sep() + ccText;
+
+        screen.setStatus (p->getName (32), valueText, ccText);
     }
 
     void GrainEditor::timerCallback()
@@ -498,12 +575,17 @@ namespace thf::grain
                 const auto pad = processor.getLastPad();
                 if (pad >= layout::numPads && padBank != 1) setPadBank (1);
                 if (pad >= 0 && pad < layout::numPads && padBank != 0) setPadBank (0);
-                if (pad >= 0) pads[(size_t) (pad % layout::numPads)]->flash();
+                if (pad >= 0)
+                {
+                    pads[(size_t) (pad % layout::numPads)]->flash();
+                    focusedPad = pad;
+                }
             }
             lastPadSerial = serial;
         }
         updateStatus();
         refreshPads();
+        for (auto& f : faders) f->refreshPickup();
         keyboard.setPadChannel (processor.getPadsAsControls() ? processor.getPadChannel() : 17);
 
         // Standalone: the window is ours, so the computer keys play as soon as it opens.
@@ -598,10 +680,13 @@ namespace thf::grain
         juce::PopupMenu menu, encoderModes, channels;
         menu.addSectionHeader (tr (juce::String::fromUTF8 ("Works with Arturia\xc2\xae MiniLab 3")));
         const auto mode = processor.getEncoderMode();
-        encoderModes.addItem (1, tr ("Relative #1 (64 +/- n)"), true, mode == midi::EncoderMode::binaryOffset);
-        encoderModes.addItem (2, tr ("Relative, two's complement"), true, mode == midi::EncoderMode::twosComplement);
-        encoderModes.addItem (3, tr ("Relative, sign bit"), true, mode == midi::EncoderMode::signMagnitude);
-        encoderModes.addItem (4, tr ("Absolute (with pickup)"), true, mode == midi::EncoderMode::absolute);
+        const auto autoMode = processor.getEncoderAutoDetect();
+        encoderModes.addItem (5, tr ("Detect automatically"), true, autoMode);
+        encoderModes.addSeparator();
+        encoderModes.addItem (1, tr ("Relative #1 (64 +/- n)"), true, ! autoMode && mode == midi::EncoderMode::binaryOffset);
+        encoderModes.addItem (2, tr ("Relative, two's complement"), true, ! autoMode && mode == midi::EncoderMode::twosComplement);
+        encoderModes.addItem (3, tr ("Relative, sign bit"), true, ! autoMode && mode == midi::EncoderMode::signMagnitude);
+        encoderModes.addItem (4, tr ("Absolute (with pickup)"), true, ! autoMode && mode == midi::EncoderMode::absolute);
         menu.addSubMenu (tr ("Encoders"), encoderModes);
         menu.addItem (10, tr ("Pads control the instrument"), true, processor.getPadsAsControls());
         for (int ch = 1; ch <= 16; ++ch)
@@ -614,6 +699,8 @@ namespace thf::grain
         {
             if (r >= 1 && r <= 4)
                 processor.setEncoderMode ((midi::EncoderMode) (r - 1));
+            else if (r == 5)
+                processor.setEncoderAutoDetect (true);
             else if (r == 10)
                 processor.setPadsAsControls (! processor.getPadsAsControls());
             else if (r > 100)

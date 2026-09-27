@@ -109,8 +109,8 @@ namespace thf::grain
     {
         if (compact || slot <= 0)
             return;
-        g.setColour (inkFaint);
-        g.setFont (ctx.lookAndFeel.font (11.0f));
+        g.setColour (inkLabel);
+        g.setFont (ctx.lookAndFeel.font (12.5f, true));
         g.drawText (juce::String (slot), getLocalBounds().removeFromBottom (14), juce::Justification::centred);
 
         const bool learning = ctx.processor.getLearningParam() == paramId && paramId.isNotEmpty();
@@ -158,11 +158,32 @@ namespace thf::grain
         slider.setBounds (r.reduced (0, 6));
     }
 
+    void ControlFader::refreshPickup()
+    {
+        const auto now = ctx.processor.getPickupState (paramId);
+        if (now.waiting != pickup.waiting || std::abs (now.hardware - pickup.hardware) > 1.0e-3f)
+        {
+            pickup = now;
+            repaint();
+        }
+    }
+
     void ControlFader::paint (juce::Graphics& g)
     {
-        g.setColour (inkFaint);
-        g.setFont (ctx.lookAndFeel.font (11.0f));
+        g.setColour (inkLabel);
+        g.setFont (ctx.lookAndFeel.font (12.5f, true));
         g.drawText (juce::String (slot), getLocalBounds().removeFromBottom (14), juce::Justification::centred);
+
+        // Where the hardware fader is while it has not picked the value up yet.
+        if (pickup.waiting && pickup.hardware >= 0.0f)
+            if (auto* p = ctx.processor.param (paramId))
+            {
+                const auto y = (float) slider.getY() + (float) slider.getPositionOfValue (p->convertFrom0to1 (pickup.hardware));
+                const auto cx = (float) slider.getBounds().getCentreX();
+                const juce::Rectangle<float> ghost (cx - 15.0f, y - 7.0f, 30.0f, 14.0f);
+                g.setColour (ink.withAlpha (0.55f));
+                g.drawRoundedRectangle (ghost, 3.0f, 1.5f);
+            }
         if (ctx.processor.getLearningParam() == paramId)
         {
             g.setColour (knobArc.withAlpha (0.18f));
@@ -207,23 +228,31 @@ namespace thf::grain
         g.drawFittedText (label, textArea.withTrimmedBottom (sub.isNotEmpty() ? 14 : 0), juce::Justification::centred, 1);
         if (sub.isNotEmpty())
         {
-            if (laf != nullptr) g.setFont (laf->font (12.0f));
-            g.setColour (inkDim);
+            if (laf != nullptr) g.setFont (laf->font (13.0f, true));
+            g.setColour (inkLabel);
             g.drawFittedText (sub, textArea.withTrimmedTop (textArea.getHeight() / 2 + 6), juce::Justification::centred, 1);
         }
     }
 
     void PadButton::mouseDown (const juce::MouseEvent& e)
     {
+        if (e.mods.isPopupMenu())
+        {
+            if (onMenu) onMenu();
+            return;
+        }
         down = true;
         repaint();
-        if (onClick) onClick (e.mods);
+        if (onPress) onPress (true);
     }
 
-    void PadButton::mouseUp (const juce::MouseEvent&)
+    void PadButton::mouseUp (const juce::MouseEvent& e)
     {
+        if (! down || e.mods.isPopupMenu())
+            return;
         down = false;
         repaint();
+        if (onPress) onPress (false);
     }
 
     //==============================================================================
@@ -403,11 +432,11 @@ namespace thf::grain
     }
 
     //==============================================================================
-    void DisplayScreen::setPage (const juce::String& name, int index, int count)
+    void DisplayScreen::setPage (const juce::String& name, int index, int count, juce::Colour colour)
     {
-        if (name != page || index != pageIndex || count != pageCount)
+        if (name != page || index != pageIndex || count != pageCount || colour != pageColour)
         {
-            page = name; pageIndex = index; pageCount = count;
+            page = name; pageIndex = index; pageCount = count; pageColour = colour;
             repaint();
         }
     }
@@ -432,10 +461,10 @@ namespace thf::grain
         auto inner = r.reduced (12.0f, 8.0f).toNearestInt();
         auto top = inner.removeFromTop (22);
         g.setFont (lookAndFeel.font (13.0f, true));
-        g.setColour (pageIndex == 0 ? accentBlue : accentOrange);
+        g.setColour (pageColour);
         g.fillEllipse ((float) top.getX(), (float) top.getCentreY() - 4.0f, 8.0f, 8.0f);
         g.setColour (glassText);
-        g.drawText (page.toUpperCase(), top.withTrimmedLeft (14), juce::Justification::centredLeft);
+        g.drawText (page, top.withTrimmedLeft (14), juce::Justification::centredLeft);
         g.setColour (glassDim);
         g.drawText (juce::String (pageIndex + 1) + "/" + juce::String (pageCount), top, juce::Justification::centredRight);
 
@@ -454,44 +483,36 @@ namespace thf::grain
     //==============================================================================
     SettingsPanel::SettingsPanel (UiContext& c) : ctx (c)
     {
-        const char* knobIds[] = { pid::root, pid::fine, pid::chaos, pid::window, pid::voices, pid::glide,
-                                  pid::bendRange, pid::velocity, pid::filterDecay, pid::modDepth, pid::spaceSize };
-        for (auto* id : knobIds)
-        {
-            auto k = std::make_unique<ControlKnob> (ctx, 0, 46.0f);
-            k->setCompact (true);
-            k->attach (id, knobArc);
-            addAndMakeVisible (*k);
-            knobs.push_back (std::move (k));
-        }
+        // Parameters without a hardware slot, grouped by what they belong to.
+        groups.resize (5);
+        groups[0].title = "Source";
+        addChoice (groups[0], pid::source);
+        addChoice (groups[0], pid::syncRate);
+        addKnob (groups[0], pid::window);
 
-        const char* choiceIds[] = { pid::source, pid::quantize, pid::scanMode, pid::syncRate, pid::voiceMode, pid::filterType,
-                                    pid::lfoShape, pid::lfoTarget, pid::lfoMode, pid::lfoDivision, pid::modTarget,
-                                    pid::linkVoices };
-        for (auto* id : choiceIds)
-        {
-            auto ch = std::make_unique<Choice>();
-            ch->paramId = id;
-            auto* param = ctx.processor.param (id);
-            if (auto* p = dynamic_cast<juce::AudioParameterChoice*> (param))
-            {
-                for (int i = 0; i < p->choices.size(); ++i)      // real entries only
-                    if (p->choices[i] != reservedChoiceName)
-                        ch->box.addItem (p->choices[i], i + 1);
-            }
-            else
-            {
-                ch->box.addItem (tr ("Off"), 1);
-                ch->box.addItem (tr ("On"), 2);
-            }
-            ch->attachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (ctx.processor.getState(), id, ch->box);
-            ch->label.setText (param->getName (32), juce::dontSendNotification);
-            styleLabel (ch->label, ctx.lookAndFeel, 12.5f, true, glassText);
-            ch->label.setJustificationType (juce::Justification::centredLeft);
-            addAndMakeVisible (ch->label);
-            addAndMakeVisible (ch->box);
-            choices.push_back (std::move (ch));
-        }
+        groups[1].title = "Voices";
+        addChoice (groups[1], pid::voiceMode);
+        addChoice (groups[1], pid::linkVoices);
+        addChoice (groups[1], pid::hold);
+        addKnob (groups[1], pid::voices);
+        addKnob (groups[1], pid::bendRange);
+        addKnob (groups[1], pid::velocity);
+
+        groups[2].title = "Filter";
+        addChoice (groups[2], pid::filterType);
+        addKnob (groups[2], pid::filterDecay);
+
+        groups[3].title = "LFO";
+        addChoice (groups[3], pid::lfoShape);
+        addChoice (groups[3], pid::lfoTarget);
+        addChoice (groups[3], pid::lfoMode);
+        addChoice (groups[3], pid::lfoDivision);
+
+        groups[4].title = "Mod and output";
+        addChoice (groups[4], pid::modTarget);
+        addKnob (groups[4], pid::modDepth);
+        addKnob (groups[4], pid::output);
+
         for (auto& k : knobs)
         {
             k->setColour (juce::Label::textColourId, glassText);
@@ -499,39 +520,102 @@ namespace thf::grain
                 if (auto* l = dynamic_cast<juce::Label*> (child))
                     l->setColour (juce::Label::textColourId, glassText);
         }
+        refreshTexts();
     }
 
-    void SettingsPanel::refreshTexts() { repaint(); }
+    void SettingsPanel::addChoice (Group& group, const char* id)
+    {
+        auto ch = std::make_unique<Choice>();
+        ch->paramId = id;
+        auto* param = ctx.processor.param (id);
+        ch->attachment = nullptr;
+        ch->label.setText (param->getName (32), juce::dontSendNotification);
+        styleLabel (ch->label, ctx.lookAndFeel, 13.0f, true, glassText);
+        ch->label.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (ch->label);
+        addAndMakeVisible (ch->box);
+        group.choices.push_back (ch.get());
+        choices.push_back (std::move (ch));
+    }
+
+    void SettingsPanel::addKnob (Group& group, const char* id)
+    {
+        auto k = std::make_unique<ControlKnob> (ctx, 0, 40.0f);
+        k->setCompact (true);
+        k->attach (id, knobArc);
+        addAndMakeVisible (*k);
+        group.knobs.push_back (k.get());
+        knobs.push_back (std::move (k));
+    }
+
+    void SettingsPanel::refreshTexts()
+    {
+        // Choice values are shown translated; the host keeps the English ones.
+        for (auto& ch : choices)
+        {
+            ch->attachment.reset();
+            ch->box.clear (juce::dontSendNotification);
+            auto* param = ctx.processor.param (ch->paramId);
+            if (auto* p = dynamic_cast<juce::AudioParameterChoice*> (param))
+            {
+                for (int i = 0; i < p->choices.size(); ++i)      // real entries only
+                    if (p->choices[i] != reservedChoiceName)
+                        ch->box.addItem (tr (p->choices[i]), i + 1);
+            }
+            else
+            {
+                ch->box.addItem (tr ("Off"), 1);
+                ch->box.addItem (tr ("On"), 2);
+            }
+            ch->attachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (ctx.processor.getState(), ch->paramId, ch->box);
+        }
+        repaint();
+    }
 
     void SettingsPanel::resized()
     {
-        auto r = getLocalBounds().reduced (18, 14);
+        auto r = getLocalBounds().reduced (14, 10);
         r.removeFromTop (24);
-        auto knobRow = r.removeFromTop (100);
-        const auto knobW = knobRow.getWidth() / (int) knobs.size();
-        for (auto& k : knobs)
-            k->setBounds (knobRow.removeFromLeft (knobW).reduced (4, 0));
-
-        r.removeFromTop (12);
-        const int perRow = 6;
-        const auto cellW = r.getWidth() / perRow;
-        for (size_t i = 0; i < choices.size(); ++i)
+        const auto columnW = r.getWidth() / (int) groups.size();
+        for (auto& group : groups)
         {
-            const auto row = (int) i / perRow, col = (int) i % perRow;
-            auto cell = juce::Rectangle<int> (r.getX() + col * cellW, r.getY() + row * 62, cellW, 58).reduced (8, 2);
-            choices[i]->label.setBounds (cell.removeFromTop (20));
-            choices[i]->box.setBounds (cell.removeFromTop (30));
+            auto col = r.removeFromLeft (columnW).reduced (6, 0);
+            group.bounds = col;
+            col.removeFromTop (22);
+            for (auto* ch : group.choices)
+            {
+                auto cell = col.removeFromTop (48);
+                ch->label.setBounds (cell.removeFromTop (18));
+                ch->box.setBounds (cell.removeFromTop (26));
+            }
+            if (! group.knobs.empty())
+            {
+                col.removeFromTop (4);
+                auto row = col.removeFromTop (juce::jmin (84, col.getHeight()));
+                const auto w = row.getWidth() / (int) group.knobs.size();
+                for (auto* k : group.knobs)
+                    k->setBounds (row.removeFromLeft (w));
+            }
         }
     }
 
     void SettingsPanel::paint (juce::Graphics& g)
     {
         auto r = getLocalBounds().toFloat();
-        g.setColour (glass.withAlpha (0.96f));
+        g.setColour (glass.withAlpha (0.97f));
         g.fillRoundedRectangle (r, 8.0f);
         g.setColour (glassText);
         g.setFont (ctx.lookAndFeel.font (14.0f, true));
-        g.drawText (tr ("More settings"), getLocalBounds().reduced (18, 12).removeFromTop (20), juce::Justification::centredLeft);
+        g.drawText (tr ("More settings"), getLocalBounds().reduced (18, 10).removeFromTop (20), juce::Justification::centredLeft);
+
+        for (const auto& group : groups)
+        {
+            g.setColour (glassDim);
+            g.setFont (ctx.lookAndFeel.font (13.0f, true));
+            g.drawText (tr (group.title), group.bounds.withHeight (18), juce::Justification::centredLeft);
+            g.setColour (glassEdge);
+            g.drawHorizontalLine (group.bounds.getY() + 19, (float) group.bounds.getX(), (float) group.bounds.getRight() - 8.0f);
+        }
     }
 
     //==============================================================================
@@ -544,14 +628,15 @@ namespace thf::grain
         // Written with "|" for the separator dot; UTF-8 stays out of C++ literals.
         const std::pair<const char*, const char*> lines[] = {
             { "Keyboard", "play grains; pitch is relative to Root" },
-            { "Main encoder", "turn: Position | click: next page" },
+            { "Main encoder", "turn: Position | click: next page | hold + turn: next sample" },
             { "Encoders 1-8", "parameters of the current page" },
-            { "Faders 1-4", "envelope; they pick up the current value" },
-            { "Pads, bank A", "Freeze | Hold | Reverse | Window | Sync | Filter | Mode | A/B" },
-            { "Pads, bank B", "cues: tap an empty pad to store, tap to jump, hold to overwrite" },
+            { "Faders 1-4", "envelope; they pick up the current value (hollow cap: hardware position)" },
+            { "Pads: Play", "tap: on/off | hold: while held | Freeze | Link | Reverse | Window | Sync | Filter | Voices | A/B" },
+            { "Pads: Cues", "tap an empty pad to store, tap to jump, hold to overwrite | pad + encoder click: delete" },
             { "Touch strips", "pitch bend | modulation (target in More settings)" },
             { "Computer keyboard", "A-K play | Z X octave | C V velocity" },
-            { "Waveform", "drag: Position | Alt-drag or vertical drag: Spray | wheel: Size" },
+            { "Waveform", "drag sideways: Position | up/down or Alt-drag: Spray | Cmd-wheel: Size | Shift-wheel: Spray" },
+            { "Cmd+Z / Shift+Cmd+Z", "undo / redo" },
             { "Right-click a control", "MIDI Learn, forget CC, reset" },
             { "Double-click a control", "default value" },
         };
@@ -563,7 +648,7 @@ namespace thf::grain
         area.removeFromTop (2);
         for (auto& [what, how] : lines)
         {
-            auto row = area.removeFromTop (21);
+            auto row = area.removeFromTop (19);
             g.setColour (glassText);
             g.setFont (lookAndFeel.font (13.5f, true));
             g.drawText (tr (what), row.removeFromLeft (220), juce::Justification::centredLeft);

@@ -31,6 +31,23 @@ void* operator new[] (std::size_t size)
     throw std::bad_alloc();
 }
 
+// The nothrow forms too (std::stable_sort's buffer), so every new pairs with our delete.
+void* operator new (std::size_t size, const std::nothrow_t&) noexcept
+{
+    if (thf::test::countAllocations.load (std::memory_order_relaxed))
+        thf::test::allocations.fetch_add (1, std::memory_order_relaxed);
+    return std::malloc (size == 0 ? 1 : size);
+}
+
+void* operator new[] (std::size_t size, const std::nothrow_t&) noexcept
+{
+    if (thf::test::countAllocations.load (std::memory_order_relaxed))
+        thf::test::allocations.fetch_add (1, std::memory_order_relaxed);
+    return std::malloc (size == 0 ? 1 : size);
+}
+
+void operator delete (void* p, const std::nothrow_t&) noexcept   { std::free (p); }
+void operator delete[] (void* p, const std::nothrow_t&) noexcept { std::free (p); }
 void operator delete (void* p) noexcept              { std::free (p); }
 void operator delete[] (void* p) noexcept            { std::free (p); }
 void operator delete (void* p, std::size_t) noexcept { std::free (p); }
@@ -57,6 +74,16 @@ public:
 
 int main()
 {
+    // Tests use their own settings file, never the user's (recent samples, preferences).
+    {
+        const auto settings = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("thf-tests.settings");
+        settings.deleteFile();
+       #if JUCE_WINDOWS
+        _putenv_s ("THF_SETTINGS_FILE", settings.getFullPathName().toRawUTF8());
+       #else
+        setenv ("THF_SETTINGS_FILE", settings.getFullPathName().toRawUTF8(), 1);
+       #endif
+    }
     juce::ScopedJuceInitialiser_GUI gui;
     AssertionCounter assertions;
     juce::Logger::setCurrentLogger (&assertions);

@@ -23,4 +23,8 @@ namespace thf::grain::library
     // A sample saved in a session whose file moved: looks for the same file name in the user
     // folder (and one level below) and in the folders of recent samples.
     juce::File findMissing (const juce::File& original);
+
+    // Per-user settings shared by every instance (thf.settings). Message thread.
+    juce::String readSetting (const juce::String& key);
+    void writeSetting (const juce::String& key, const juce::String& value);
 }

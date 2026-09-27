@@ -148,11 +148,23 @@ namespace thf::grain
         }
         g.drawFittedText (title, header.withTrimmedRight (372), juce::Justification::centredLeft, 1);
 
-        // Grid.
+        // Centre line and time ticks (1, 2, 5, 10... s apart, at least 60 px).
         g.setColour (glassGrid);
-        for (int i = 1; i < 8; ++i)
-            g.drawVerticalLine ((int) (area.getX() + area.getWidth() * (float) i / 8.0f), area.getY(), area.getBottom());
         g.drawHorizontalLine ((int) area.getCentreY(), area.getX(), area.getRight());
+        if (source != nullptr && source->getDurationSeconds() > 0.0)
+        {
+            const auto seconds = source->getDurationSeconds();
+            const auto pxPerSecond = area.getWidth() / seconds;
+            double step = 0.001;
+            for (double candidate : { 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0 })
+                if ((step = candidate) * pxPerSecond >= 60.0)
+                    break;
+            for (double t = step; t < seconds; t += step)
+            {
+                const auto x = area.getX() + (float) (t * pxPerSecond);
+                g.drawVerticalLine ((int) x, area.getBottom() - 6.0f, area.getBottom());
+            }
+        }
 
         if (source == nullptr)
         {
@@ -302,6 +314,7 @@ namespace thf::grain
 
         drag = Drag::position;
         dragging = true;
+        axis = e.mods.isAltDown() ? Axis::spray : Axis::undecided;
         dragStartY = e.y;
         dragStartSpray = proc.param (pid::spray)->getValue();
         proc.param (pid::position)->beginChangeGesture();
@@ -327,14 +340,17 @@ namespace thf::grain
         }
         if (! dragging)
             return;
-        if (! e.mods.isAltDown())
+        // The first 6 px decide: sideways = Position, up/down = Spray (Alt: Spray at once).
+        if (axis == Axis::undecided && e.getDistanceFromDragStart() >= 6)
+            axis = std::abs (e.getDistanceFromDragStartX()) >= std::abs (e.getDistanceFromDragStartY()) ? Axis::position : Axis::spray;
+        if (axis == Axis::position || axis == Axis::undecided)
         {
             proc.param (pid::position)->setValueNotifyingHost (toRelative (xToPosition ((float) e.x)));
             proc.requestScanReset();
         }
-        const auto dy = (float) (dragStartY - e.y) / waveArea().getHeight();
-        if (std::abs (dy) > 0.02f || e.mods.isAltDown())
+        else
         {
+            const auto dy = (float) (dragStartY - e.y) / waveArea().getHeight();
             proc.param (pid::spray)->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, dragStartSpray + dy));
             if (ctx.onFocus) ctx.onFocus (pid::spray);
         }
@@ -354,6 +370,12 @@ namespace thf::grain
 
     void WaveformView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
     {
+        // Only with a modifier: a trackpad scrolling past must not change the sound.
+        if (! e.mods.isCommandDown() && ! e.mods.isShiftDown())
+        {
+            juce::Component::mouseWheelMove (e, w);
+            return;
+        }
         auto* p = ctx.processor.param (e.mods.isShiftDown() ? pid::spray : pid::size);
         p->beginChangeGesture();
         p->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, p->getValue() + w.deltaY * 0.05f));

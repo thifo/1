@@ -1,4 +1,5 @@
 #include "Parameters.h"
+#include "ControlLayout.h"
 
 namespace thf::grain
 {
@@ -37,19 +38,38 @@ namespace thf::grain
             return r;
         }
 
+        // Text typed into a host's value field, in the units the parameter shows: "50 %",
+        // "2 kHz", "1.5 s", "+3 st" all mean what they say.
+        float parseValue (const juce::String& text)
+        {
+            const auto t = text.trim().toLowerCase();
+            auto v = t.getFloatValue();
+            if (t.contains ("%"))                                      v *= 0.01f;   // shown as value x 100
+            else if (t.endsWith ("khz") || t.endsWith ("k"))           v *= 1000.0f;
+            else if (t.endsWith (" s") || (t.endsWith ("s") && ! t.endsWith ("ms") && ! t.endsWith ("hz")))
+                v *= 1000.0f;                                          // seconds into ms
+            return v;
+        }
+
         auto floatParam (const char* id, const char* name, Range range, float def,
-                         std::function<juce::String (float)> toText)
+                         std::function<juce::String (float)> toText,
+                         std::function<float (const juce::String&)> fromText = parseValue)
         {
             return std::make_unique<juce::AudioParameterFloat> (
                 juce::ParameterID (id, version), name, range, def,
                 Attributes().withStringFromValueFunction ([toText] (float v, int) { return toText (v); })
-                            .withValueFromStringFunction ([] (const juce::String& s) { return s.getFloatValue(); }));
+                            .withValueFromStringFunction (fromText));
         }
 
         auto percentParam (const char* id, const char* name, float def)
         {
             return floatParam (id, name, Range (0.0f, 1.0f), def,
-                               [] (float v) { return juce::String (v * 100.0f, 1) + " %"; });
+                               [] (float v) { return juce::String (v * 100.0f, 1) + " %"; },
+                               [] (const juce::String& s)
+                               {
+                                   const auto v = s.getFloatValue();
+                                   return s.contains ("%") || std::abs (v) > 1.0f ? v * 0.01f : v;
+                               });
         }
 
         auto choiceParam (const char* id, const char* name, const juce::StringArray& choices, int def, int reserveTo = 0)
@@ -71,15 +91,40 @@ namespace thf::grain
         return juce::MidiMessage::getMidiNoteName (midiNote, true, true, 3);
     }
 
+    int parseNote (const juce::String& text)
+    {
+        // "C3" = 60 (as shown), "F#2", "Bb4", or a plain MIDI number.
+        const auto t = text.trim().toUpperCase();
+        if (t.isEmpty()) return 60;
+        if (juce::CharacterFunctions::isDigit (t[0]) || t[0] == '-')
+            return juce::jlimit (0, 127, t.getIntValue());
+        static const int base[] = { 9, 11, 0, 2, 4, 5, 7 };   // A B C D E F G
+        const auto letter = t[0];
+        if (letter < 'A' || letter > 'G') return 60;
+        int note = base[letter - 'A'];
+        int i = 1;
+        if (i < t.length() && t[i] == '#') { ++note; ++i; }
+        else if (i < t.length() && (t[i] == 'B' || t[i] == 'b')) { --note; ++i; }
+        const auto octave = t.substring (i).getIntValue();
+        return juce::jlimit (0, 127, note + 12 * (octave + 2));
+    }
+
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
     {
-        juce::AudioProcessorValueTreeState::ParameterLayout layout;
+        // Collected first, then added in the order hosts list them: the three encoder pages
+        // (banks of 8 in Live), the faders, Position, then everything else.
+        struct Collector
+        {
+            std::vector<std::unique_ptr<juce::RangedAudioParameter>> all;
+            void add (std::unique_ptr<juce::RangedAudioParameter> p) { all.push_back (std::move (p)); }
+        } layout;
 
         // Source and grains
         layout.add (choiceParam (pid::source, "Source", sourceChoices, 1, reservedSources));
         layout.add (std::make_unique<juce::AudioParameterInt> (
             juce::ParameterID (pid::root, version), "Root", 0, 127, 60,
-            juce::AudioParameterIntAttributes().withStringFromValueFunction ([] (int v, int) { return noteName (v); })));
+            juce::AudioParameterIntAttributes().withStringFromValueFunction ([] (int v, int) { return noteName (v); })
+                                               .withValueFromStringFunction ([] (const juce::String& s) { return parseNote (s); })));
         layout.add (percentParam (pid::position, "Position", 0.25f));
         layout.add (percentParam (pid::regionStart, "Sample Start", 0.0f));
         layout.add (percentParam (pid::regionEnd, "Sample End", 1.0f));
@@ -148,6 +193,22 @@ namespace thf::grain
         layout.add (boolParam (pid::safeClip, "Safe Clip", true));
         layout.add (boolParam (pid::hq, "HQ", false));
 
-        return layout;
+        std::vector<std::string_view> order;
+        for (const auto& page : layout::encoderParams)
+            order.insert (order.end(), page.begin(), page.end());
+        order.insert (order.end(), layout::faderParams.begin(), layout::faderParams.end());
+        order.push_back (layout::mainEncoderParam);
+        auto rank = [&order] (const juce::RangedAudioParameter& p)
+        {
+            const auto id = p.getParameterID().toStdString();
+            const auto it = std::find (order.begin(), order.end(), std::string_view (id));
+            return it != order.end() ? (int) (it - order.begin()) : (int) order.size();
+        };
+        std::stable_sort (layout.all.begin(), layout.all.end(),
+                          [&rank] (const auto& a, const auto& b) { return rank (*a) < rank (*b); });
+
+        juce::AudioProcessorValueTreeState::ParameterLayout result;
+        result.add (layout.all.begin(), layout.all.end());
+        return result;
     }
 }

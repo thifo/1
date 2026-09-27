@@ -1008,6 +1008,7 @@ public:
 
             midi.clear();
             midi.addEvent (juce::MidiMessage::controllerEvent (1, 118, 127), 0); // main click
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 118, 0), 10);
             process (p, midi);
             expectEquals (p.getPage(), 1);
 
@@ -1035,9 +1036,9 @@ public:
             auto* position = p.param (pid::position);
             const auto posBefore = position->getValue();
             midi.clear();
-            midi.addEvent (juce::MidiMessage::controllerEvent (1, 28, 67), 0);   // main encoder +3
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 28, 67), 0);   // main encoder +3, slow
             process (p, midi);
-            expectWithinAbsoluteError (position->getValue() - posBefore, 0.006f, 1.0e-4f);
+            expectWithinAbsoluteError (position->getValue() - posBefore, 0.003f, 1.0e-4f);
         }
 
         beginTest ("Pads: bank A toggles, bank B stores and recalls cues");
@@ -1049,7 +1050,7 @@ public:
             midi.addEvent (juce::MidiMessage::noteOn (10, 39, 1.0f), 1);          // pad 4: Window
             process (p, midi);
             expect (p.param (pid::freeze)->getValue() > 0.5f);
-            expectWithinAbsoluteError (p.param (pid::window)->getValue(), 0.5f, 1.0e-6f);
+            expectWithinAbsoluteError (p.param (pid::window)->getValue(), 1.0f, 1.0e-6f);
 
             // Notes on the pad channel outside the pad range still play.
             midi.clear();
@@ -1072,6 +1073,123 @@ public:
             midi.addEvent (juce::MidiMessage::noteOff (10, 44), 100);
             process (p, midi);
             expectWithinAbsoluteError (p.param (pid::position)->getValue(), 0.3f, 1.0e-3f);
+        }
+
+        beginTest ("MiniLab: learn refuses template CCs, encoder mode is detected");
+        {
+            GrainProcessor p;
+            p.prepareToPlay (rate, 512);
+            juce::MidiBuffer midi;
+            p.startLearn (pid::chaos);
+            for (int cc : { 74, 82, 28, 118, 1, 64, 0, 32, 121 })
+            {
+                midi.clear();
+                midi.addEvent (juce::MidiMessage::controllerEvent (1, cc, 10), 0);
+                process (p, midi);
+                expect (p.isLearning(), "learn took reserved CC " + juce::String (cc));
+                expectEquals (p.getLearnRefusedCc(), cc);
+            }
+            midi.clear();
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 20, 10), 0);
+            process (p, midi);
+            expect (! p.isLearning());
+            expectEquals (p.getCcFor (pid::chaos), 20);
+
+            // Detection: an absolute ramp, then relative 63/65 repeats.
+            thf::midi::EncoderModeDetector d;
+            for (int v : { 60, 61, 62, 63, 64, 65, 66 }) d.feed (v);
+            expect (! d.hasDecided());                      // ambiguous so far
+            for (int v : { 80, 81, 82 }) d.feed (v);
+            expect (d.getMode() == thf::midi::EncoderMode::absolute);
+            d.reset();
+            for (int v : { 65, 65, 65, 63 }) d.feed (v);
+            expect (d.getMode() == thf::midi::EncoderMode::binaryOffset);
+            d.reset();
+            for (int v : { 1, 1, 1 }) d.feed (v);
+            expect (d.getMode() == thf::midi::EncoderMode::twosComplement);
+            d.reset();
+            for (int v : { 90, 110, 127, 127, 127 }) d.feed (v);   // absolute resting at the top
+            expect (d.getMode() == thf::midi::EncoderMode::absolute);
+        }
+
+        beginTest ("Main encoder: accelerates when spun, hold + turn browses, click deletes a held cue");
+        {
+            auto spin = [] (int gapSamples)
+            {
+                GrainProcessor p;
+                p.prepareToPlay (rate, 512);
+                auto* position = p.param (pid::position);
+                position->setValueNotifyingHost (0.1f);
+                const auto before = position->getValue();
+                for (int i = 0; i < 10; ++i)
+                {
+                    juce::MidiBuffer midi;
+                    midi.addEvent (juce::MidiMessage::controllerEvent (1, 28, 65), 0);
+                    process (p, midi, gapSamples);
+                }
+                return position->getValue() - before;
+            };
+            const auto fast = spin (480), slow = spin (4800);   // 10 ticks in 100 ms vs 1 s
+            logMessage ("  10 ticks in 100 ms: " + juce::String (fast * 100.0f, 2) + " %, in 1 s: " + juce::String (slow * 100.0f, 2) + " %");
+            expect (fast > slow * 2.0f);
+
+            GrainProcessor p;
+            p.prepareToPlay (rate, 512);
+            juce::MidiBuffer midi;
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 118, 127), 0);   // hold
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 28, 66), 10);    // turn +2
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 118, 0), 20);    // release
+            process (p, midi);
+            expectEquals (p.peekBrowseRequest(), 2);
+            expectEquals (p.getPage(), 0);                                          // no page change
+
+            p.setCue (3, 0.4f);
+            midi.clear();
+            midi.addEvent (juce::MidiMessage::noteOn (10, 47, 1.0f), 0);            // cue pad 4 held
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 118, 127), 10);   // + click
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 118, 0), 20);
+            midi.addEvent (juce::MidiMessage::noteOff (10, 47), 30);
+            process (p, midi);
+            expectEquals (p.getCue (3), -1.0f);
+            expectEquals (p.getPage(), 0);
+        }
+
+        beginTest ("Pads: amounts come back, holding is momentary");
+        {
+            GrainProcessor p;
+            p.prepareToPlay (rate, 512);
+            auto* reverse = p.param (pid::reverse);
+            reverse->setValueNotifyingHost (0.35f);
+            p.pressPad (2, true, 0.0);  p.pressPad (2, false, 0.05);          // tap: off
+            expectWithinAbsoluteError (reverse->getValue(), 0.0f, 1.0e-6f);
+            p.pressPad (2, true, 1.0);  p.pressPad (2, false, 1.05);          // tap: back to 35 %
+            expectWithinAbsoluteError (reverse->getValue(), 0.35f, 1.0e-6f);
+
+            auto* freeze = p.param (pid::freeze);
+            p.pressPad (0, true, 2.0);
+            expect (freeze->getValue() > 0.5f);
+            p.pressPad (0, false, 2.8);                                        // held: momentary
+            expect (freeze->getValue() < 0.5f);
+        }
+
+        beginTest ("Host text entry: units are understood");
+        {
+            GrainProcessor p;
+            auto check = [this, &p] (const char* id, const char* text, float expected)
+            {
+                auto* param = p.param (id);
+                expectWithinAbsoluteError (param->convertFrom0to1 (param->getValueForText (text)), expected, expected * 0.01f + 1.0e-3f,
+                                           juce::String (id) + " <- " + text);
+            };
+            check (pid::spray, "50 %", 0.5f);
+            check (pid::spray, "0.5", 0.5f);
+            check (pid::cutoff, "2 kHz", 2000.0f);
+            check (pid::cutoff, "440 Hz", 440.0f);
+            check (pid::size, "1.5 s", 1500.0f);
+            check (pid::size, "120 ms", 120.0f);
+            check (pid::root, "C3", 60.0f);
+            check (pid::root, "F#2", 54.0f);
+            check (pid::pitch, "+7 st", 7.0f);
         }
 
         beginTest ("On-screen / computer keyboard notes reach the engine");
@@ -1135,7 +1253,6 @@ public:
                 a.param (pid::size)->setValueNotifyingHost (0.7f);
                 a.param (pid::cutoff)->setValueNotifyingHost (0.4f);
                 a.setCue (2, 0.42f);
-                a.setEncoderMode (thf::midi::EncoderMode::twosComplement);
                 a.startLearn (pid::chaos);
                 juce::MidiBuffer midi;
                 midi.addEvent (juce::MidiMessage::controllerEvent (1, 21, 0), 0);
@@ -1151,7 +1268,6 @@ public:
             expectWithinAbsoluteError (b.param (pid::cutoff)->getValue(), 0.4f, 1.0e-6f);
             expectWithinAbsoluteError (b.getCue (2), 0.42f, 1.0e-5f);
             expectEquals (b.getCue (0), -1.0f);
-            expect (b.getEncoderMode() == thf::midi::EncoderMode::twosComplement);
             expectEquals (b.getCcFor (pid::chaos), 21);
             expect (b.getUserSample() != nullptr, "embedded sample not restored");
             if (auto s = b.getUserSample())
@@ -1528,6 +1644,45 @@ public:
             expect (pk.process (0.1f, 0.2f));        // crossed
             expect (pk.process (0.15f, 0.1f));       // follows
             expect (! pk.process (0.9f, 0.5f));      // moved elsewhere: must pick up again
+        }
+
+        beginTest ("Every UI string has a Russian translation");
+        {
+            const auto root = juce::File (__FILE__).getParentDirectory().getParentDirectory().getChildFile ("plugins/granular");
+            const auto table = thf::Translator::parse (root.getChildFile ("Resources/ru_grain.txt").loadFileAsString());
+            juce::StringArray keys;
+            // Literals passed to tr() and the tables the UI translates.
+            for (const auto& entry : juce::RangedDirectoryIterator (root.getChildFile ("Source"), true, "*.cpp"))
+            {
+                const auto text = entry.getFile().loadFileAsString();
+                for (auto pattern : { "tr (\"", "title = \"" })
+                    for (int i = text.indexOf (pattern); i >= 0; i = text.indexOf (i + 1, pattern))
+                    {
+                        const auto start = i + (int) std::strlen (pattern);
+                        const auto end = text.indexOf (start, "\"");
+                        keys.addIfNotAlreadyThere (text.substring (start, end));
+                    }
+            }
+            for (auto page : layout::pageNames) keys.addIfNotAlreadyThere (juce::String (std::string (page)));
+            for (auto& pad : layout::padsBankA) keys.addIfNotAlreadyThere (juce::String (std::string (pad.label)));
+            for (auto* list : { &sourceChoices, &scanModeChoices, &voiceModeChoices, &filterChoices, &lfoShapeChoices,
+                                &modTargetChoices, &quantizeChoices, &lfoModeChoices })
+                for (auto& c : *list) keys.addIfNotAlreadyThere (c);
+            for (auto& preset : factoryPresets()) keys.addIfNotAlreadyThere (preset.category);
+            // Help lines: { "what", "how" } pairs.
+            const auto views = root.getChildFile ("Source/ui/GrainViews.cpp").loadFileAsString();
+            const auto help = views.fromFirstOccurrenceOf ("lines[] = {", false, false).upToFirstOccurrenceOf ("};", false, false);
+            for (int i = help.indexOf ("\""); i >= 0;)
+            {
+                const auto end = help.indexOf (i + 1, "\"");
+                keys.addIfNotAlreadyThere (help.substring (i + 1, end));
+                i = help.indexOf (end + 1, "\"");
+            }
+            juce::StringArray missing;
+            for (auto& k : keys)
+                if (k.isNotEmpty() && table.find (k) == table.end() && k != "thf" && k != "?")
+                    missing.add (k);
+            expect (missing.isEmpty(), "untranslated: " + missing.joinIntoString (" | "));
         }
 
         beginTest ("Translation table parsing");

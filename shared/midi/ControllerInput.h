@@ -28,6 +28,58 @@ namespace thf::midi
         return 0;
     }
 
+    // Tells from the values an endless encoder sends which of the modes above it uses.
+    // Relative encoders repeat values around 64 (or around 0/127 in two's complement) while
+    // turning; absolute ones never repeat and wander over the whole range.
+    class EncoderModeDetector
+    {
+    public:
+        // Feeds one value; returns true when the detected mode changes.
+        bool feed (int value) noexcept
+        {
+            const bool repeat = value == last;
+            last = value;
+            const bool nearCentre = value >= 49 && value <= 79;
+            const bool nearEdges = value <= 15 || value >= 113;
+
+            if (! nearCentre && ! nearEdges)
+                return decide (EncoderMode::absolute);          // only absolute gets here
+
+            // An absolute control resting at an end stop may repeat 0 or 127: not evidence.
+            if (repeat && decided && mode == EncoderMode::absolute && (value == 0 || value == 127))
+                return false;
+
+            if (repeat)
+            {
+                if (++repeats >= 2)
+                    return decide (nearCentre ? EncoderMode::binaryOffset : EncoderMode::twosComplement);
+            }
+            else
+            {
+                repeats = 0;
+            }
+            return false;
+        }
+
+        bool hasDecided() const noexcept      { return decided; }
+        EncoderMode getMode() const noexcept  { return mode; }
+        void reset() noexcept                 { decided = false; repeats = 0; last = -1; }
+
+    private:
+        bool decide (EncoderMode m) noexcept
+        {
+            const bool changed = ! decided || m != mode;
+            decided = true;
+            mode = m;
+            repeats = 0;
+            return changed;
+        }
+
+        EncoderMode mode = EncoderMode::binaryOffset;
+        bool decided = false;
+        int repeats = 0, last = -1;
+    };
+
     // Soft takeover for an absolute control: the control only starts moving the parameter
     // once it reaches or crosses the parameter's current value. After the parameter is
     // changed from anywhere else (mouse, automation, preset) the control must pick it up again.
