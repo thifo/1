@@ -72,7 +72,10 @@ namespace thf::grain
         inline constexpr const char* hq         = "hq";
     }
 
-    // Choice lists (order is part of the saved state: append only).
+    // Choice lists (order is part of the saved state: append only). Hosts store automation of a
+    // choice as index / (count - 1), so a list that grows would shift every existing curve:
+    // the parameters are created with room to grow (reservedChoices), and these lists hold
+    // only the real entries.
     inline const juce::StringArray sourceChoices   { "Sample", "Saw Pad", "Voice", "Bell", "Noise", "Glass",
                                                      "Vocal Phrase", "Chord Stack", "Pluck", "Keys" };
     inline const juce::StringArray scanModeChoices { "Global", "Per Note" };
@@ -85,6 +88,10 @@ namespace thf::grain
     inline const juce::StringArray lfoModeChoices  { "Free", "Sync" };
     inline const juce::StringArray lfoDivisionChoices { "4 bars", "2 bars", "1 bar", "1/2", "1/4", "1/8", "1/16",
                                                         "1/4T", "1/8T", "1/4D" };
+
+    inline constexpr int reservedSources = 32, reservedTargets = 16, reservedShapes = 8,
+                         reservedQuantize = 12, reservedRates = 12, reservedDivisions = 16, reservedFilters = 8;
+    inline constexpr const char* reservedChoiceName = "(reserved)";
 
     // Beats per grain for each syncRate choice.
     inline constexpr double syncRateBeats[] = { 1.0, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125, 0.0625 };

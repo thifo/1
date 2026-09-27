@@ -28,7 +28,7 @@ namespace thf::grain
 
     class GrainProcessor : public juce::AudioProcessor,
                            private juce::Timer,
-                           private juce::ValueTree::Listener
+                           private juce::AudioProcessorParameter::Listener
     {
     public:
         GrainProcessor();
@@ -104,6 +104,27 @@ namespace thf::grain
 
         // A/B comparison of parameter sets.
         void toggleAB();
+
+        // Undo: snapshots of parameters (and optionally cues + own sample). Only the user's
+        // own gestures, preset changes, A/B and sample loads are recorded, never automation.
+        struct Snapshot
+        {
+            std::vector<float> params;          // normalised
+            std::array<float, 8> cues {};
+            bool withSample = false;
+            SourceData::Ptr sample;
+        };
+        Snapshot captureSnapshot (bool withSample) const;
+        void applySnapshot (const Snapshot&);
+        void recordChange (const juce::String& name, const Snapshot& before);
+
+        // Fades the output out (waiting at most ~20 ms) so many parameters can change at once
+        // without the audio hearing half-applied states; the output fades back in by itself.
+        void fadeForChange();
+
+        // Hardware moves reach the host from the message thread, inside begin/end gestures.
+        // Called by the timer; tests call it directly.
+        void flushHardwareChanges();
         int getABSlot() const noexcept              { return abSlot; }
 
         // MIDI settings and learn.
@@ -148,7 +169,9 @@ namespace thf::grain
 
     private:
         void timerCallback() override;
-        void valueTreePropertyChanged (juce::ValueTree&, const juce::Identifier&) override;
+        void parameterValueChanged (int, float) override {}
+        void parameterGestureChanged (int index, bool starting) override;
+        float currentValue (const juce::RangedAudioParameter*) const noexcept;
 
         void handleMidi (const juce::MidiMessage&, const EngineParams&);
         bool handleController (int cc, int value);
@@ -157,6 +180,8 @@ namespace thf::grain
         void setParamFromAudio (juce::RangedAudioParameter*, float normalised);
         void touched (juce::RangedAudioParameter*, int cc);
         void publishSource (SourceData::Ptr);
+        sources::LoadOptions loadOptions (juce::uint32 generation) const;
+        void reloadForSampleRate();
 
         juce::ValueTree saveExtraState (bool includeMidi) const;
         void restoreExtraState (const juce::ValueTree&, bool includeMidi);
@@ -195,8 +220,31 @@ namespace thf::grain
         std::array<std::atomic<float>, 8> cues;
         std::atomic<int> page { 0 };
         int abSlot = 0;
-        std::array<juce::ValueTree, 2> abStates;
+        std::array<std::vector<float>, 2> abParams;
         std::atomic<bool> abRequested { false };
+
+        // Hardware -> host hand-over (audio thread writes, message thread flushes).
+        std::vector<std::atomic<float>*> rawValues;
+        std::unique_ptr<std::atomic<float>[]> pendingHardware;
+        std::unique_ptr<std::atomic<bool>[]> queuedHardware;
+        std::array<int, 1024> hardwareRing {};
+        std::atomic<uint32_t> hardwareWrite { 0 }, hardwareRead { 0 };
+        std::vector<bool> gestureOpen;
+        std::vector<juce::uint32> lastHardwareMove;
+
+        // Undo bookkeeping (message thread).
+        std::vector<float> gestureStartValue;
+        bool applyingHistory = false;
+        std::atomic<bool> clearHistoryPending { false };
+
+        // Cues and region remembered per sample (by content hash) for this session.
+        struct SampleMemory { std::array<float, 8> cues {}; float regionStart = 0.0f, regionEnd = 1.0f; };
+        std::map<juce::String, SampleMemory> sampleMemory;
+
+        // Output fade for bulk changes.
+        std::atomic<bool> fadeRequested { false };
+        juce::uint32 fadeReleaseAt = 0;
+        std::atomic<juce::uint32> loadGeneration { 0 };
 
         // MIDI mapping.
         std::atomic<int> encoderMode { (int) midi::EncoderMode::binaryOffset };
@@ -216,8 +264,8 @@ namespace thf::grain
         std::atomic<bool> keepSample { true };
         std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
         int64_t samplesProcessed = 0;
-        juce::uint32 lastTreeChangeMs = 0;
-        double hostSampleRate = 48000.0;
+
+        std::atomic<double> hostSampleRate { 48000.0 };
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GrainProcessor)
     };

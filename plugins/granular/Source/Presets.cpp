@@ -335,7 +335,8 @@ namespace thf::grain
         if (index < 0 || index >= (int) factory.size())
             return;
         const auto keep = captureLockedSample();
-        processor.getUndoManager().beginNewTransaction();
+        const auto before = processor.captureSnapshot (true);
+        processor.fadeForChange();
         resetToDefaults();
         for (const auto& [id, value] : factory[(size_t) index].values)
             if (auto* p = processor.param (id))
@@ -343,7 +344,7 @@ namespace thf::grain
         for (int i = 0; i < 8; ++i)
             processor.setCue (i, -1.0f);
         restoreLockedSample (keep);
-        processor.getUndoManager().beginNewTransaction();
+        processor.recordChange ("Preset", before);
         currentName = factory[(size_t) index].name;
         if (onChange) onChange();
     }
@@ -355,7 +356,8 @@ namespace thf::grain
             return false;
 
         const auto keep = captureLockedSample();
-        processor.getUndoManager().beginNewTransaction();
+        const auto before = processor.captureSnapshot (true);
+        processor.fadeForChange();
         resetToDefaults();
         for (auto* child : xml->getChildWithTagNameIterator ("PARAM"))
             if (auto* p = processor.param (child->getStringAttribute ("id")))
@@ -384,7 +386,7 @@ namespace thf::grain
         {
             restoreLockedSample (keep);
         }
-        processor.getUndoManager().beginNewTransaction();
+        processor.recordChange ("Preset", before);
         currentName = xml->getStringAttribute ("name", file.getFileNameWithoutExtension());
         if (onChange) onChange();
         return true;

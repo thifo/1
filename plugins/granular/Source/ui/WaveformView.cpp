@@ -142,8 +142,9 @@ namespace thf::grain
         {
             if (source->detectedNote >= 0.0f)
                 title << sep() << tr ("pitch") << " " << noteName (juce::roundToInt (source->detectedNote));
-            if (source->embeddedFlac.getSize() == 0)
-                title << sep() << tr ("not saved in the project");
+            if (source->originalPeak > 0.0f)
+                title << sep() << tr ("peak") << " " << juce::String (juce::Decibels::gainToDecibels (source->originalPeak), 1) << " dB";
+            title << sep() << (source->embeddedFlac.getSize() > 0 ? tr ("in the project") : tr ("linked"));
         }
         g.drawFittedText (title, header.withTrimmedRight (372), juce::Justification::centredLeft, 1);
 

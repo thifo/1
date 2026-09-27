@@ -27,6 +27,7 @@ namespace thf::grain
     void GrainEngine::prepare (double sr)
     {
         sampleRate = sr > 0.0 ? sr : 48000.0;
+        switchFadeSamples = juce::jmax (16, (int) (0.008 * sampleRate));
         reverb.setSampleRate (sampleRate);
         reset();
     }
@@ -69,6 +70,7 @@ namespace thf::grain
         }
         for (auto& g : grains)
             g.active = false;
+        heldPrevious = nullptr;
         drive.reset();
         reverb.reset();
         reverbTail = 0;
@@ -85,16 +87,25 @@ namespace thf::grain
         activeGrainsForUi.store (0);
     }
 
-    void GrainEngine::setSource (const SourceData* s) noexcept
+    void GrainEngine::setSource (SourceData::Ptr s) noexcept
     {
-        if (s == source)
+        if (s.get() == source)
             return;
-        // Grains point into the old source's octave copies: drop them.
+        // Grains still fading from an even older source are cut: their source is about to
+        // lose the engine's reference.
         for (auto& g : grains)
-            g.active = false;
-        for (auto& v : voices)
-            v.grains = 0;
-        source = s;
+            if (g.active && g.src != source)
+            {
+                g.active = false;
+                --voices[(size_t) g.voice].grains;
+            }
+        // Grains of the current source fade out quickly instead of stopping dead.
+        for (auto& g : grains)
+            if (g.active && g.fadeOut == 0)
+                g.fadeOut = switchFadeSamples;
+        heldPrevious = heldSource;
+        heldSource = s;
+        source = s.get();
     }
 
     void GrainEngine::resetScan() noexcept
@@ -376,8 +387,11 @@ namespace thf::grain
             return;
 
         Grain* g = nullptr;
-        for (auto& candidate : grains)
-            if (! candidate.active) { g = &candidate; break; }
+        for (int k = 0; k < maxGrains && g == nullptr; ++k)
+        {
+            auto& candidate = grains[(size_t) ((nextGrain + k) % maxGrains)];
+            if (! candidate.active) { g = &candidate; nextGrain = (nextGrain + k + 1) % maxGrains; }
+        }
         if (g == nullptr)
             return;
 
@@ -392,18 +406,32 @@ namespace thf::grain
                          + modulation.pitch + quantizeInterval (p.jitter * rJitter, p.quantize);
         const auto ratio = juce::jlimit (1.0 / 64.0, 32.0,
                                          std::exp2 ((double) semis / 12.0) * source->getSampleRate() / sampleRate);
-        const auto span0 = (double) sizeSamples * ratio;
+        auto span0 = (double) sizeSamples * ratio;
 
         // Position, spray and scan are relative to the region; grains stay inside it when they fit.
         const auto regionStart = juce::jlimit (0.0, 1.0, (double) juce::jmin (p.regionStart, p.regionEnd));
         const auto regionLength = juce::jmax (1.0e-3, juce::jlimit (0.0, 1.0, (double) juce::jmax (p.regionStart, p.regionEnd)) - regionStart);
         const auto scanOffset = p.perNoteScan ? v.scanOffset : globalScan;
         const auto spray = juce::jlimit (0.0f, 1.0f, p.spray + modulation.spray);
-        const auto relative = wrap01 ((double) p.position + modulation.position + scanOffset + rSpray * spray);
+        // The playhead wraps around the region; the spray around it reflects at the edges so
+        // no grains pile up on the boundary.
+        auto relative = (double) wrap01 ((double) p.position + modulation.position + scanOffset) + rSpray * spray;
+        if (relative < 0.0) relative = -relative;
+        if (relative > 1.0) relative = 2.0 - relative;
+        relative = juce::jlimit (0.0, 1.0, relative);
         const auto lo = regionStart * length0;
         const auto hi = (regionStart + regionLength) * length0;
-        const auto start0 = juce::jlimit (0.0, juce::jmax (0.0, length0 - span0),
-                                          juce::jlimit (lo, juce::jmax (lo, hi - span0), lo + relative * (hi - lo)));
+
+        // A grain longer than the material it may read is shortened to fit, so it never
+        // plays silence past the end.
+        if (span0 > hi - lo)
+        {
+            sizeSamples = juce::jmax (1.0f, (float) ((hi - lo) / ratio));
+            span0 = (double) sizeSamples * ratio;
+            fade = dsp::windowFade (p.window, sizeSamples, (float) sampleRate);
+        }
+        // Grain starts are spread over the usable part of the region, [lo, hi - span].
+        const auto start0 = juce::jlimit (0.0, juce::jmax (0.0, length0 - span0), lo + relative * juce::jmax (0.0, hi - lo - span0));
         const bool reversed = rReverse < p.reverse;
 
         // Octave copy: HQ reads the copy just below the ratio and band-limits the rest with a
@@ -416,6 +444,8 @@ namespace thf::grain
         const auto effective = ratio * scale;
 
         g->active = true;
+        g->src = source;
+        g->fadeOut = 0;
         g->voice = voiceIndex;
         g->level = level;
         g->step = reversed ? -effective : effective;
@@ -541,28 +571,35 @@ namespace thf::grain
 
     void GrainEngine::renderGrains (int n, bool hq)
     {
-        if (source == nullptr)
-            return;
-        const bool stereoSource = source->getNumChannels() > 1;
         constexpr int margin = SourceData::padding - 2 * dsp::SincTable::halfTaps - 4;
+        const auto fadeScale = 1.0f / (float) switchFadeSamples;
 
         int active = 0;
+        bool previousInUse = false;
         for (auto& g : grains)
         {
             if (! g.active)
                 continue;
             ++active;
+            const auto* src = g.src;
+            previousInUse = previousInUse || src != source;
+            const bool stereoSource = src->getNumChannels() > 1;
             auto* outL = voiceBuffer[g.voice][0];
             auto* outR = voiceBuffer[g.voice][1];
-            const auto* srcL = source->channel (g.level, 0);
-            const auto* srcR = source->channel (g.level, 1);
-            const auto levelLength = source->getLevelLength (g.level);
+            const auto* srcL = src->channel (g.level, 0);
+            const auto* srcR = src->channel (g.level, 1);
+            const auto levelLength = src->getLevelLength (g.level);
 
             for (int i = g.startOffset; i < n; ++i)
             {
                 if (g.age >= g.length)
                     break;
-                const auto w = windowTable.value ((float) g.age * g.invLength, g.fade);
+                auto w = windowTable.value ((float) g.age * g.invLength, g.fade);
+                if (g.fadeOut > 0)
+                {
+                    w *= (float) g.fadeOut * fadeScale;
+                    if (--g.fadeOut == 0) { g.age = g.length; break; }
+                }
                 const auto ip = (int) std::floor (g.readPos);
                 const auto frac = (float) (g.readPos - ip);
                 float l = 0.0f, r = 0.0f;
@@ -595,6 +632,10 @@ namespace thf::grain
             }
         }
         activeGrainsForUi.store (active, std::memory_order_relaxed);
+
+        // The old source can go once its last grain has faded (this only drops a reference).
+        if (! previousInUse && heldPrevious != nullptr)
+            heldPrevious = nullptr;
     }
 
     //==============================================================================
@@ -703,9 +744,13 @@ namespace thf::grain
             gainSmoothed += (p.outputGain - gainSmoothed) * (1.0f - std::exp (-(float) len / (0.01f * (float) sampleRate)));
             const auto gainStep = (gainSmoothed - startGain) / (float) len;
             bool bad = false;
+            const auto fadeStep = 1.0f / (0.005f * (float) sampleRate);
             for (int i = 0; i < len; ++i)
             {
-                const auto gain = (startGain + gainStep * (float) (i + 1)) * headroom;
+                if (std::abs (fadeGain - fadeTarget) > 0.0f)
+                    fadeGain = fadeTarget > fadeGain ? juce::jmin (fadeTarget, fadeGain + fadeStep)
+                                                     : juce::jmax (fadeTarget, fadeGain - fadeStep);
+                const auto gain = (startGain + gainStep * (float) (i + 1)) * headroom * fadeGain;
                 auto l = L[i] * gain, r = R[i] * gain;
                 if (p.safeClip) { l = safeClip (l); r = safeClip (r); }
                 if (! std::isfinite (l) || ! std::isfinite (r)) { l = r = 0.0f; bad = true; }
@@ -714,11 +759,18 @@ namespace thf::grain
             }
             if (bad)
             {
-                // Something blew up (should never happen): silence and clear filter state.
+                // Something blew up (should never happen): silence and clear every state that
+                // could hold the NaN, including the reverb and the smoothers.
                 for (auto& v : voices) { v.filter[0].reset(); v.filter[1].reset(); }
                 drive.reset();
+                reverb.reset();
+                levelSmoothed = 1.0f;
+                gainSmoothed = -1.0f;
+                driveSmoothed = 0.0f;
+                resonanceSmoothed = -1.0f;
             }
             done += len;
         }
+        fadedOut.store (fadeGain <= 0.0f, std::memory_order_release);
     }
 }

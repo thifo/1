@@ -17,8 +17,10 @@ namespace thf::grain
         static constexpr int padding = 48;        // zeros around each level for interpolation
         static constexpr int overviewSize = 2048; // peak buckets for the display
 
-        // Copies and sanitises the audio (non-finite samples become 0), builds levels and peaks.
-        static Ptr fromBuffer (const juce::AudioBuffer<float>& audio, double sampleRate, const juce::String& name);
+        // Copies and sanitises the audio (non-finite samples become 0, DC removed), converts it
+        // to targetRate if given (band-limited sinc), builds levels and peaks.
+        static Ptr fromBuffer (const juce::AudioBuffer<float>& audio, double sampleRate, const juce::String& name,
+                               double targetRate = 0.0);
 
         int getNumChannels() const noexcept     { return numChannels; }
         int getLength() const noexcept          { return length; }
@@ -49,6 +51,9 @@ namespace thf::grain
         juce::MemoryBlock embeddedFlac;   // for sessions; empty if the sample is too long
         float detectedNote = -1.0f;       // fractional MIDI note of the sample's pitch, -1 = none
         float pitchConfidence = 0.0f;     // 0..1
+        bool pitchFromFile = false;       // from the file's own root-note metadata
+        double originalRate = 0.0;        // the file's rate (the data may be converted)
+        float originalPeak = 0.0f;
 
     private:
         SourceData() = default;
@@ -65,15 +70,28 @@ namespace thf::grain
     // Loading and generation helpers (message or background thread only).
     namespace sources
     {
-        // Maximum length accepted from a file, in seconds.
+        // Limits for files: length and memory (frames x channels, before octave copies).
         inline constexpr double maxFileSeconds = 600.0;
+        inline constexpr juce::int64 maxTotalSamples = 64 * 1024 * 1024;
+        // Samples up to this length travel inside the session (FLAC of the original audio).
+        inline constexpr double maxEmbedSeconds = 60.0;
 
-        // Reads wav / aiff / flac (and whatever else the format manager knows).
-        // Returns nullptr and fills `error` on failure.
-        SourceData::Ptr loadFile (const juce::File&, juce::String& error);
+        struct LoadOptions
+        {
+            double targetRate = 0.0;               // convert to the host rate (0 = keep)
+            std::function<bool()> cancelled;       // polled while reading; true = give up
+            bool embed = true;                     // prepare the FLAC for the session
+            juce::int64 maxSamples = maxTotalSamples;   // frames x channels this load may take
+        };
 
-        // Decodes a file image kept in memory (sessions embed small samples as FLAC).
-        SourceData::Ptr loadFromMemory (const void* data, size_t size, const juce::String& name, juce::String& error);
+        // Reads any format the platform knows. Returns nullptr and fills `error` on failure
+        // (including running out of memory: never throws).
+        SourceData::Ptr loadFile (const juce::File&, juce::String& error, const LoadOptions& = {});
+
+        // Decodes a file image kept in memory (sessions embed samples as FLAC); the image
+        // itself becomes the embedded copy.
+        SourceData::Ptr loadFromMemory (const void* data, size_t size, const juce::String& name, juce::String& error,
+                                        const LoadOptions& = {});
 
         // Encodes audio as 24-bit FLAC for embedding into the session.
         juce::MemoryBlock encodeFlac (const juce::AudioBuffer<float>& audio, double sampleRate);
@@ -87,8 +105,13 @@ namespace thf::grain
         // Extensions the platform can read, e.g. "wav;aif;aiff;flac;mp3;m4a;caf" on macOS.
         juce::String audioExtensions();
 
-        // Fundamental of a pitched sample (YIN over several loud windows). Fills
-        // detectedNote / pitchConfidence; leaves -1 for unpitched material.
+        // Fundamental of a pitched sample (YIN over several loud windows) between start and end
+        // (0..1 of the sample). note = -1 for unpitched material.
+        struct PitchEstimate { float note = -1.0f, confidence = 0.0f; };
+        PitchEstimate estimatePitch (const SourceData&, float start = 0.0f, float end = 1.0f);
+
+        // Fills detectedNote / pitchConfidence from the whole sample (unless the file's own
+        // metadata already did).
         void detectPitch (SourceData&);
     }
 }

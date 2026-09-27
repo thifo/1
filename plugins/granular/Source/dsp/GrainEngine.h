@@ -76,8 +76,8 @@ namespace thf::grain
     {
     public:
         static constexpr int maxVoices = 16;
-        static constexpr int maxGrains = 384;
         static constexpr int maxGrainsPerVoice = 48;
+        static constexpr int maxGrains = maxVoices * maxGrainsPerVoice;   // no voice ever starves
         static constexpr int controlBlock = 32;     // samples between parameter/LFO updates
 
         GrainEngine();
@@ -86,8 +86,12 @@ namespace thf::grain
         void reset();
         void setSeed (uint32_t seed) noexcept { seed_ = seed; }
 
-        // The source must stay alive while render() runs; nullptr = silence.
-        void setSource (const SourceData* s) noexcept;
+        // Switches the source. Grains of the old one fade out over 8 ms (no click); the engine
+        // keeps a reference until they are gone, so the caller may drop its own at any time.
+        // The engine never frees a source: the last reference must live elsewhere (the
+        // processor's retired list or the factory set), so releasing here only decrements.
+        void setSource (SourceData::Ptr s) noexcept;
+        void setSource (const SourceData* s) noexcept { setSource (SourceData::Ptr (const_cast<SourceData*> (s))); }
 
         void noteOn (int note, float velocity, const EngineParams&);
         void noteOff (int note, const EngineParams&);
@@ -97,6 +101,10 @@ namespace thf::grain
         void setPitchBend (float bipolar) noexcept  { bend = bipolar; }
         void setModWheel (float unipolar) noexcept  { modWheel = unipolar; }
         void resetScan() noexcept;
+        // 5 ms fade of the whole output (bulk parameter changes). isFadedOut() is true once
+        // the output has reached silence; any thread may read it.
+        void setFadedOut (bool out) noexcept { fadeTarget = out ? 0.0f : 1.0f; }
+        bool isFadedOut() const noexcept     { return fadedOut.load (std::memory_order_acquire); }
         // Called once per host block when the LFO follows the transport.
         void syncLfo (double ppqPosition, double beatsPerCycle) noexcept { lfo.setPhase (ppqPosition / beatsPerCycle); }
 
@@ -124,6 +132,8 @@ namespace thf::grain
             int age = 0, length = 1, startOffset = 0;
             float invLength = 1, fade = 0.5f;
             float gainL = 1, gainR = 1;
+            const SourceData* src = nullptr;
+            int fadeOut = 0;        // > 0: samples left of a fade-out (source switch)
         };
 
         struct Voice
@@ -165,6 +175,9 @@ namespace thf::grain
         double sampleRate = 48000.0;
         uint32_t seed_ = 0x7f4a7c15u;
         const SourceData* source = nullptr;
+        SourceData::Ptr heldSource, heldPrevious;
+        int nextGrain = 0;
+        int switchFadeSamples = 384;
         dsp::Random rng;
         dsp::WindowTable windowTable;
         dsp::SincTable sincTable;
@@ -176,6 +189,8 @@ namespace thf::grain
         juce::Reverb::Parameters reverbParams;
         int reverbTail = 0;          // samples to keep running the reverb after Space goes to 0
         float levelSmoothed = 1.0f;
+        float fadeGain = 1.0f, fadeTarget = 1.0f;
+        std::atomic<bool> fadedOut { false };
 
         std::array<Voice, maxVoices> voices {};
         std::array<Grain, maxGrains> grains {};

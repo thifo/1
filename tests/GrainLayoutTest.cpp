@@ -76,6 +76,7 @@ public:
                     midi.addEvent (juce::MidiMessage::controllerEvent (1, layout::minilab3::encoderCC[(size_t) slot], 66), 0);
                     juce::AudioBuffer<float> buffer (2, 64);
                     processor.processBlock (buffer, midi);
+                    processor.flushHardwareChanges();
                     expect (p->getValue() > 0.5f, "slot " + juce::String (slot + 1) + " on page " + juce::String (page)
                                                   + ": " + juce::String (p->getValue()) + " steps " + juce::String (p->getNumSteps()));
                     expectEquals (processor.getCcFor (shown), layout::minilab3::encoderCC[(size_t) slot]);

@@ -39,6 +39,13 @@ namespace thf::grain
             std::this_thread::sleep_for (std::chrono::milliseconds (5));
     }
 
+    namespace
+    {
+        // True while this thread is inside processBlock: parameter writes from there go
+        // through the hardware hand-over instead of talking to the host directly.
+        thread_local bool inProcessBlock = false;
+    }
+
     //==============================================================================
     struct GrainProcessor::Raw
     {
@@ -76,7 +83,7 @@ namespace thf::grain
     //==============================================================================
     GrainProcessor::GrainProcessor()
         : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-          state (*this, &undoManager, "PARAMS", createParameterLayout())
+          state (*this, nullptr, "PARAMS", createParameterLayout())   // undo is our own (see recordChange)
     {
         for (auto* p : getParameters())
             params.push_back (dynamic_cast<juce::RangedAudioParameter*> (p));
@@ -94,8 +101,22 @@ namespace thf::grain
         for (auto& c : cues) c.store (-1.0f);
         for (auto& l : learned) l.store (-1);
 
-        state.state.addListener (this);
-        startTimerHz (10);
+        const auto count = params.size();
+        pendingHardware.reset (new std::atomic<float>[count]);
+        queuedHardware.reset (new std::atomic<bool>[count]);
+        for (size_t i = 0; i < count; ++i)
+        {
+            rawValues.push_back (state.getRawParameterValue (params[i]->getParameterID()));
+            pendingHardware[i].store (-1.0f);
+            queuedHardware[i].store (false);
+            params[i]->addListener (this);
+        }
+        gestureOpen.assign (count, false);
+        lastHardwareMove.assign (count, 0);
+        gestureStartValue.assign (count, 0.0f);
+
+        undoManager.setMaxNumberOfStoredUnits (400, 20);
+        startTimerHz (30);
     }
 
     GrainProcessor::~GrainProcessor()
@@ -103,7 +124,12 @@ namespace thf::grain
         *alive = false;
         stopTimer();
         loader.removeAllJobs (true, 5000);
-        state.state.removeListener (this);
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            if (gestureOpen[i])
+                params[i]->endChangeGesture();   // a hardware move still "held"
+            params[i]->removeListener (this);
+        }
     }
 
     int GrainProcessor::indexOf (juce::StringRef id) const
@@ -127,7 +153,9 @@ namespace thf::grain
 
     void GrainProcessor::prepareToPlay (double sampleRate, int)
     {
-        hostSampleRate = sampleRate;
+        const auto previousRate = hostSampleRate.exchange (sampleRate);
+        if (std::abs (previousRate - sampleRate) > 0.5 && getUserSample() != nullptr)
+            reloadForSampleRate();
         engine.prepare (sampleRate);
         for (auto& p : pickups) p.reset();
     }
@@ -192,6 +220,7 @@ namespace thf::grain
     void GrainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
     {
         juce::ScopedNoDenormals noDenormals;
+        const juce::ScopedValueSetter<bool> audioScope (inProcessBlock, true);
         const auto numSamples = buffer.getNumSamples();
 
         // Source: user sample (try-lock, never block) or a built-in one.
@@ -315,11 +344,82 @@ namespace thf::grain
         lastTouchedSerial.fetch_add (1);
     }
 
+    float GrainProcessor::currentValue (const juce::RangedAudioParameter* p) const noexcept
+    {
+        // A hardware move not yet flushed to the host is the value that counts.
+        const auto pending = pendingHardware[(size_t) p->getParameterIndex()].load();
+        return pending >= 0.0f ? pending : p->getValue();
+    }
+
     void GrainProcessor::setParamFromAudio (juce::RangedAudioParameter* p, float normalised)
     {
-        normalised = juce::jlimit (0.0f, 1.0f, normalised);
-        if (std::abs (p->getValue() - normalised) > 1.0e-6f)
+        const auto& range = p->getNormalisableRange();
+        normalised = range.convertTo0to1 (range.snapToLegalValue (range.convertFrom0to1 (juce::jlimit (0.0f, 1.0f, normalised))));
+        if (std::abs (currentValue (p) - normalised) <= 1.0e-6f)
+            return;
+
+        // Outside the audio callback (clicks on the on-screen pads) the host is told directly.
+        if (! inProcessBlock)
+        {
+            p->beginChangeGesture();
             p->setValueNotifyingHost (normalised);
+            p->endChangeGesture();
+            return;
+        }
+
+        // Audio thread: the engine hears the new value at once (raw value), the host is told
+        // from the message thread inside a gesture (flushHardwareChanges). No locks, no
+        // allocations, no host calls here.
+        const auto index = (size_t) p->getParameterIndex();
+        pendingHardware[index].store (normalised);
+        rawValues[index]->store (range.convertFrom0to1 (normalised));
+        if (! queuedHardware[index].exchange (true))
+        {
+            const auto w = hardwareWrite.load (std::memory_order_relaxed);
+            if (w - hardwareRead.load (std::memory_order_acquire) < (uint32_t) hardwareRing.size())
+            {
+                hardwareRing[w % hardwareRing.size()] = (int) index;
+                hardwareWrite.store (w + 1, std::memory_order_release);
+            }
+            else
+            {
+                queuedHardware[index].store (false);
+            }
+        }
+    }
+
+    void GrainProcessor::flushHardwareChanges()
+    {
+        const auto now = juce::Time::getMillisecondCounter();
+        auto r = hardwareRead.load (std::memory_order_relaxed);
+        const auto w = hardwareWrite.load (std::memory_order_acquire);
+        for (; r != w; ++r)
+        {
+            const auto index = (size_t) hardwareRing[r % hardwareRing.size()];
+            queuedHardware[index].store (false);
+            auto value = pendingHardware[index].load();
+            if (value < 0.0f)
+                continue;
+            auto* p = params[index];
+            if (! gestureOpen[index])
+            {
+                p->beginChangeGesture();
+                gestureOpen[index] = true;
+            }
+            p->setValueNotifyingHost (value);
+            lastHardwareMove[index] = now;
+            pendingHardware[index].compare_exchange_strong (value, -1.0f);   // unless moved again meanwhile
+        }
+        hardwareRead.store (r, std::memory_order_release);
+
+        // A control that has been still for 300 ms ends its gesture (one undo step, one
+        // automation touch).
+        for (size_t i = 0; i < gestureOpen.size(); ++i)
+            if (gestureOpen[i] && now - lastHardwareMove[i] > 300 && pendingHardware[i].load() < 0.0f)
+            {
+                params[i]->endChangeGesture();
+                gestureOpen[i] = false;
+            }
     }
 
     void GrainProcessor::nudgeParam (juce::RangedAudioParameter* p, int ticks)
@@ -333,9 +433,9 @@ namespace thf::grain
             steps = p->getNumSteps();
 
         if (steps > 1 && steps <= 200)
-            setParamFromAudio (p, p->getValue() + (float) ticks / (float) (steps - 1));
+            setParamFromAudio (p, currentValue (p) + (float) ticks / (float) (steps - 1));
         else
-            setParamFromAudio (p, p->getValue() + (float) ticks * 0.005f);
+            setParamFromAudio (p, currentValue (p) + (float) ticks * 0.005f);
     }
 
     bool GrainProcessor::handleController (int cc, int value)
@@ -370,7 +470,7 @@ namespace thf::grain
             auto* p = params[(size_t) index];
             if (isTemplateEncoder() && mode != midi::EncoderMode::absolute)
                 nudgeParam (p, midi::decodeRelative (value, mode));
-            else if (pickups[(size_t) cc].process (normalised, p->getValue()))
+            else if (pickups[(size_t) cc].process (normalised, currentValue (p)))
                 setParamFromAudio (p, normalised);
             touched (p, cc);
             return true;
@@ -383,7 +483,7 @@ namespace thf::grain
             auto* p = encoderSlots[(size_t) page.load()][(size_t) slot];
             if (mode == midi::EncoderMode::absolute)
             {
-                if (pickups[(size_t) cc].process (normalised, p->getValue()))
+                if (pickups[(size_t) cc].process (normalised, currentValue (p)))
                     setParamFromAudio (p, normalised);
             }
             else
@@ -399,7 +499,7 @@ namespace thf::grain
             if (faderCC[(size_t) slot] != cc)
                 continue;
             auto* p = faderSlots[(size_t) slot];
-            if (pickups[(size_t) cc].process (normalised, p->getValue()))
+            if (pickups[(size_t) cc].process (normalised, currentValue (p)))
                 setParamFromAudio (p, normalised);
             touched (p, cc);
             return true;
@@ -410,7 +510,7 @@ namespace thf::grain
             // Fine position: 0.2 % per tick; the encoder accelerates by itself.
             auto* p = mainEncoderSlot;
             const auto ticks = midi::decodeRelative (value, midi::EncoderMode::binaryOffset);
-            setParamFromAudio (p, p->getValue() + (float) ticks * 0.002f);
+            setParamFromAudio (p, currentValue (p) + (float) ticks * 0.002f);
             touched (p, cc);
             return true;
         }
@@ -485,15 +585,15 @@ namespace thf::grain
         auto toggle = [this] (const char* id)
         {
             auto* p = param (id);
-            setParamFromAudio (p, p->getValue() > 0.5f ? 0.0f : 1.0f);
+            setParamFromAudio (p, currentValue (p) > 0.5f ? 0.0f : 1.0f);
             touched (p, -1);
         };
-        auto cycle = [this] (const char* id)
+        // Cycles through the real entries only (the lists are longer, see reservedChoices).
+        auto cycle = [this] (const char* id, int realCount)
         {
             auto* p = param (id);
-            const auto steps = juce::jmax (2, p->getNumSteps());
-            const auto index = juce::roundToInt (p->getValue() * (float) (steps - 1));
-            setParamFromAudio (p, (float) ((index + 1) % steps) / (float) (steps - 1));
+            const auto index = juce::roundToInt (p->convertFrom0to1 (currentValue (p)));
+            setParamFromAudio (p, p->convertTo0to1 ((float) ((index + 1) % realCount)));
             touched (p, -1);
         };
 
@@ -503,13 +603,13 @@ namespace thf::grain
             case layout::PadAction::hold:           toggle (pid::hold); break;
             case layout::PadAction::reverse:        toggle (pid::reverse); break;
             case layout::PadAction::sync:           toggle (pid::sync); break;
-            case layout::PadAction::filterCycle:    cycle (pid::filterType); break;
-            case layout::PadAction::voiceModeCycle: cycle (pid::voiceMode); break;
+            case layout::PadAction::filterCycle:    cycle (pid::filterType, filterChoices.size()); break;
+            case layout::PadAction::voiceModeCycle: cycle (pid::voiceMode, voiceModeChoices.size()); break;
             case layout::PadAction::abToggle:       abRequested.store (true); break;
             case layout::PadAction::windowCycle:
             {
                 auto* p = param (pid::window);
-                const auto v = p->getValue();
+                const auto v = currentValue (p);
                 setParamFromAudio (p, v < 0.25f ? 0.5f : (v < 0.75f ? 1.0f : 0.0f));
                 touched (p, -1);
                 break;
@@ -605,18 +705,42 @@ namespace thf::grain
 
     void GrainProcessor::setUserSample (SourceData::Ptr s)
     {
-        // A different sample: the old region and cues point at nothing meaningful any more.
+        const auto before = captureSnapshot (true);
         const auto previous = getUserSample();
+
+        // Cues and region belong to a sample: remember the old sample's, bring back the new
+        // one's if it was used before in this session, otherwise start clean.
         if (s != nullptr && (previous == nullptr || previous->contentHash != s->contentHash))
         {
-            for (auto& c : cues) c.store (-1.0f);
-            for (auto* id : { pid::regionStart, pid::regionEnd })
-                if (auto* p = param (id))
-                    p->setValueNotifyingHost (p->getDefaultValue());
+            if (previous != nullptr)
+            {
+                SampleMemory m;
+                for (size_t i = 0; i < cues.size(); ++i) m.cues[i] = cues[i].load();
+                m.regionStart = param (pid::regionStart)->getValue();
+                m.regionEnd = param (pid::regionEnd)->getValue();
+                sampleMemory[previous->contentHash] = m;
+            }
+            SampleMemory next;
+            next.cues.fill (-1.0f);
+            if (auto it = sampleMemory.find (s->contentHash); it != sampleMemory.end())
+                next = it->second;
+            for (size_t i = 0; i < cues.size(); ++i) cues[i].store (next.cues[i]);
+            for (auto [id, value] : { std::pair { pid::regionStart, next.regionStart }, std::pair { pid::regionEnd, next.regionEnd } })
+            {
+                auto* p = param (id);
+                p->beginChangeGesture();
+                p->setValueNotifyingHost (value);
+                p->endChangeGesture();
+            }
         }
         publishSource (s);
         if (auto* p = param (pid::source))
+        {
+            p->beginChangeGesture();
             p->setValueNotifyingHost (0.0f);    // "Sample"
+            p->endChangeGesture();
+        }
+        recordChange ("Load sample", before);
     }
 
     SourceData::Ptr GrainProcessor::getUserSample() const
@@ -635,24 +759,64 @@ namespace thf::grain
 
     namespace
     {
-        constexpr double maxEmbedSeconds = 60.0;
-
-        void attachEmbedding (SourceData& s)
+        // Samples too long to travel inside the session are copied once into the user's
+        // library (~/Music/thf Grain Samples/Library), and the session points there: moving
+        // or deleting the original never breaks the project.
+        void keepInLibrary (SourceData& s)
         {
-            if (s.getDurationSeconds() <= maxEmbedSeconds && s.contentHash.isNotEmpty())
-                s.embeddedFlac = sources::encodeFlac (s.copyOriginal(), s.getSampleRate());
+            if (s.embeddedFlac.getSize() > 0 || ! s.file.existsAsFile() || s.file.isAChildOf (library::userFolder()))
+                return;
+            auto folder = library::userFolder().getChildFile ("Library");
+            folder.createDirectory();
+            const auto copy = folder.getChildFile (s.contentHash.substring (0, 12) + " " + s.file.getFileName());
+            if (copy.existsAsFile() || s.file.copyFileTo (copy))
+                s.file = copy;
         }
+    }
+
+    sources::LoadOptions GrainProcessor::loadOptions (juce::uint32 generation) const
+    {
+        sources::LoadOptions options;
+        options.targetRate = hostSampleRate.load();
+        options.cancelled = [this, generation] { return generation != 0 && generation != loadGeneration.load(); };
+        return options;
     }
 
     bool GrainProcessor::loadSampleSync (const juce::File& file, juce::String& error)
     {
-        auto s = sources::loadFile (file, error);
+        auto s = sources::loadFile (file, error, loadOptions (0));
         if (s == nullptr)
             return false;
-        attachEmbedding (*s);
+        keepInLibrary (*s);
         setUserSample (s);
         library::addRecent (file);
         return true;
+    }
+
+    void GrainProcessor::reloadForSampleRate()
+    {
+        // The host rate changed: rebuild the sample from its original audio (embedded copy
+        // or file) at the new rate, in the background. Until then the old data plays, in tune.
+        const auto current = getUserSample();
+        if (current == nullptr)
+            return;
+        const auto generation = ++loadGeneration;
+        std::weak_ptr<bool> token = alive;
+        loader.addJob ([this, current, generation, token]
+        {
+            juce::String error;
+            const auto options = loadOptions (generation);
+            SourceData::Ptr rebuilt;
+            if (current->embeddedFlac.getSize() > 0)
+                rebuilt = sources::loadFromMemory (current->embeddedFlac.getData(), current->embeddedFlac.getSize(),
+                                                   current->getName(), error, options);
+            else if (current->file.existsAsFile())
+                rebuilt = sources::loadFile (current->file, error, options);
+            if (rebuilt == nullptr || token.expired() || generation != loadGeneration.load())
+                return;
+            rebuilt->file = current->file;
+            publishSource (rebuilt);
+        });
     }
 
     void GrainProcessor::clearUserSample()
@@ -663,9 +827,16 @@ namespace thf::grain
     bool GrainProcessor::applyDetectedRoot()
     {
         const auto s = getUserSample();
-        if (s == nullptr || s->detectedNote < 0.0f)
+        if (s == nullptr)
             return false;
-        const auto root = juce::roundToInt (s->detectedNote);
+        // The file's own root note, or the pitch of the part in use (the region).
+        auto note = s->detectedNote;
+        const auto start = param (pid::regionStart)->getValue(), end = param (pid::regionEnd)->getValue();
+        if (! s->pitchFromFile && (start > 0.0f || end < 1.0f))
+            note = sources::estimatePitch (*s, start, end).note;
+        if (note < 0.0f)
+            return false;
+        const auto root = juce::roundToInt (note);
         auto set = [this] (const char* id, float value)
         {
             auto* p = param (id);
@@ -675,7 +846,7 @@ namespace thf::grain
         };
         undoManager.beginNewTransaction();
         set (pid::root, (float) juce::jlimit (0, 127, root));
-        set (pid::fine, juce::jlimit (-100.0f, 100.0f, -(s->detectedNote - (float) root) * 100.0f));
+        set (pid::fine, juce::jlimit (-100.0f, 100.0f, -(note - (float) root) * 100.0f));
         return true;
     }
 
@@ -687,16 +858,18 @@ namespace thf::grain
             lastLoadError.clear();
         }
         sourceSerial.fetch_add (1);
+        // Only the newest request (or a session/preset restore after it) may land.
+        const auto generation = ++loadGeneration;
         std::weak_ptr<bool> token = alive;
-        loader.addJob ([this, file, token]
+        loader.addJob ([this, file, token, generation]
         {
             juce::String error;
-            auto s = sources::loadFile (file, error);
+            auto s = sources::loadFile (file, error, loadOptions (generation));
             if (s != nullptr)
-                attachEmbedding (*s);
-            juce::MessageManager::callAsync ([this, s, error, token]
+                keepInLibrary (*s);
+            juce::MessageManager::callAsync ([this, s, error, token, generation]
             {
-                if (token.expired())
+                if (token.expired() || generation != loadGeneration.load())
                     return;
                 loading.store (false);
                 if (s != nullptr)
@@ -715,22 +888,148 @@ namespace thf::grain
     }
 
     //==============================================================================
+    //==============================================================================
+    // Undo and A/B.
+    namespace
+    {
+        // One parameter moved by one gesture (mouse drag, hardware move).
+        struct ParamAction : juce::UndoableAction
+        {
+            ParamAction (GrainProcessor& p, int i, float from, float to) : processor (p), index (i), before (from), after (to) {}
+            bool perform() override { return set (after); }
+            bool undo() override    { return set (before); }
+            int getSizeInUnits() override { return 1; }
+
+            bool set (float value)
+            {
+                auto snapshot = processor.captureSnapshot (false);
+                snapshot.params[(size_t) index] = value;
+                processor.applySnapshot (snapshot);
+                return true;
+            }
+
+            GrainProcessor& processor;
+            int index;
+            float before, after;
+        };
+
+        // A bulk change: preset, A/B, sample load.
+        struct SnapshotAction : juce::UndoableAction
+        {
+            SnapshotAction (GrainProcessor& p, GrainProcessor::Snapshot from, GrainProcessor::Snapshot to)
+                : processor (p), before (std::move (from)), after (std::move (to)) {}
+            bool perform() override { processor.applySnapshot (after); return true; }
+            bool undo() override    { processor.applySnapshot (before); return true; }
+            // Samples are heavy: keep only a few of them in the history.
+            int getSizeInUnits() override { return before.withSample || after.withSample ? 40 : 4; }
+
+            GrainProcessor& processor;
+            GrainProcessor::Snapshot before, after;
+        };
+    }
+
+    GrainProcessor::Snapshot GrainProcessor::captureSnapshot (bool withSample) const
+    {
+        Snapshot s;
+        s.params.reserve (params.size());
+        for (auto* p : params)
+            s.params.push_back (currentValue (p));
+        for (size_t i = 0; i < cues.size(); ++i)
+            s.cues[i] = cues[i].load();
+        s.withSample = withSample;
+        if (withSample)
+            s.sample = getUserSample();
+        return s;
+    }
+
+    void GrainProcessor::applySnapshot (const Snapshot& s)
+    {
+        const juce::ScopedValueSetter<bool> guard (applyingHistory, true);
+        if (s.withSample && s.sample != getUserSample())
+            publishSource (s.sample);
+        for (size_t i = 0; i < params.size() && i < s.params.size(); ++i)
+            if (std::abs (params[i]->getValue() - s.params[i]) > 1.0e-6f)
+            {
+                params[i]->beginChangeGesture();
+                params[i]->setValueNotifyingHost (s.params[i]);
+                params[i]->endChangeGesture();
+            }
+        for (size_t i = 0; i < cues.size(); ++i)
+            cues[i].store (s.cues[i]);
+    }
+
+    void GrainProcessor::recordChange (const juce::String& name, const Snapshot& before)
+    {
+        if (applyingHistory || ! juce::MessageManager::existsAndIsCurrentThread())
+            return;
+        undoManager.beginNewTransaction (name);
+        undoManager.perform (new SnapshotAction (*this, before, captureSnapshot (before.withSample)));
+    }
+
+    void GrainProcessor::parameterGestureChanged (int index, bool starting)
+    {
+        // Only the user's own gestures on the message thread become undo steps; automation
+        // never sends gestures, and other threads never touch the history.
+        if (applyingHistory || index < 0 || index >= (int) params.size()
+            || ! juce::MessageManager::existsAndIsCurrentThread())
+            return;
+        if (starting)
+        {
+            gestureStartValue[(size_t) index] = params[(size_t) index]->getValue();
+            return;
+        }
+        const auto before = gestureStartValue[(size_t) index];
+        const auto after = params[(size_t) index]->getValue();
+        if (std::abs (after - before) > 1.0e-6f)
+        {
+            const juce::ScopedValueSetter<bool> guard (applyingHistory, true);
+            undoManager.beginNewTransaction (params[(size_t) index]->getName (32));
+            undoManager.perform (new ParamAction (*this, index, before, after));
+        }
+    }
+
+    void GrainProcessor::fadeForChange()
+    {
+        // Ask the audio thread to fade out and wait for it (bounded: the audio may not run).
+        engine.setFadedOut (true);
+        fadeRequested.store (true);
+        for (int waited = 0; waited < 20 && ! engine.isFadedOut(); ++waited)
+            juce::Thread::sleep (1);
+        fadeReleaseAt = juce::Time::getMillisecondCounter() + 15;
+    }
+
     void GrainProcessor::toggleAB()
     {
-        abStates[(size_t) abSlot] = state.copyState();
+        // Parameters only (the sample stays), applied like any other change: with gestures,
+        // as one undo step, and without clearing the undo history.
+        const auto before = captureSnapshot (false);
+        abParams[(size_t) abSlot] = before.params;
         abSlot ^= 1;
-        undoManager.beginNewTransaction();
-        if (abStates[(size_t) abSlot].isValid())
-            state.replaceState (abStates[(size_t) abSlot].createCopy());
-        else
-            abStates[(size_t) abSlot] = state.copyState();
-        undoManager.beginNewTransaction();
+        if (! abParams[(size_t) abSlot].empty())
+        {
+            fadeForChange();
+            auto target = before;
+            target.params = abParams[(size_t) abSlot];
+            applySnapshot (target);
+        }
+        recordChange ("A/B", before);
     }
 
     void GrainProcessor::timerCallback()
     {
+        flushHardwareChanges();
+
         if (abRequested.exchange (false))
             toggleAB();
+
+        if (fadeRequested.load() && juce::Time::getMillisecondCounter() >= fadeReleaseAt)
+        {
+            fadeRequested.store (false);
+            engine.setFadedOut (false);
+        }
+
+        if (clearHistoryPending.exchange (false))
+            undoManager.clearUndoHistory();
 
         // Free samples nobody uses any more (never on the audio thread).
         {
@@ -739,16 +1038,6 @@ namespace thf::grain
                                            [] (const SourceData::Ptr& s) { return s->getReferenceCount() <= 1; }),
                            retired.end());
         }
-
-        // Group parameter changes into undo steps: a pause of 0.6 s closes a step.
-        if (undoManager.getNumActionsInCurrentTransaction() > 0
-            && juce::Time::getMillisecondCounter() - lastTreeChangeMs > 600)
-            undoManager.beginNewTransaction();
-    }
-
-    void GrainProcessor::valueTreePropertyChanged (juce::ValueTree&, const juce::Identifier&)
-    {
-        lastTreeChangeMs = juce::Time::getMillisecondCounter();
     }
 
     //==============================================================================
@@ -801,6 +1090,7 @@ namespace thf::grain
 
     void GrainProcessor::restoreExtraState (const juce::ValueTree& extra, bool includeMidi)
     {
+        ++loadGeneration;   // a pending asynchronous load must not land on top of this
         if (includeMidi && extra.hasProperty ("keepSample"))
             keepSample.store ((bool) extra.getProperty ("keepSample"));
         const auto cueList = juce::StringArray::fromTokens (extra.getProperty ("cues").toString(), ",", "");
@@ -809,7 +1099,7 @@ namespace thf::grain
 
         const auto sample = extra.getChildWithName ("Sample");
         SourceData::Ptr loaded;
-        juce::String missing;
+        juce::String missing, relinkError;
         if (sample.isValid())
         {
             const juce::File file (sample.getProperty ("path").toString());
@@ -821,26 +1111,32 @@ namespace thf::grain
                 flac = *binary;
             else if (flacValue.isString())
                 flac.fromBase64Encoding (flacValue.toString());
+            const auto options = loadOptions (0);
+            const auto expectedHash = sample.getProperty ("hash").toString();
             if (flac.getSize() > 0)
             {
-                loaded = sources::loadFromMemory (flac.getData(), flac.getSize(), sample.getProperty ("name"), error);
+                loaded = sources::loadFromMemory (flac.getData(), flac.getSize(), sample.getProperty ("name"), error, options);
                 if (loaded != nullptr)
                 {
                     loaded->file = file;
-                    loaded->contentHash = sample.getProperty ("hash");
-                    loaded->embeddedFlac = flac;
+                    if (expectedHash.isNotEmpty())
+                        loaded->contentHash = expectedHash;
                 }
             }
             // Not embedded (too long): the file itself, or the same file name where the user
-            // keeps samples (moved projects, another computer).
+            // keeps samples (moved projects, another computer) -- but only if it is the same
+            // audio, never a different file that happens to share the name.
             auto candidate = file;
             if (loaded == nullptr && ! candidate.existsAsFile() && file.getFileName().isNotEmpty())
                 candidate = library::findMissing (file);
             if (loaded == nullptr && candidate.existsAsFile())
             {
-                loaded = sources::loadFile (candidate, error);
-                if (loaded != nullptr)
-                    attachEmbedding (*loaded);
+                loaded = sources::loadFile (candidate, error, options);
+                if (loaded != nullptr && expectedHash.isNotEmpty() && loaded->contentHash != expectedHash)
+                {
+                    loaded = nullptr;
+                    relinkError = "A file with this name was found, but its audio is different";
+                }
             }
             if (loaded == nullptr && sample.getProperty ("path").toString().isNotEmpty())
                 missing = file.getFullPathName();
@@ -849,6 +1145,7 @@ namespace thf::grain
         {
             const juce::ScopedLock l (statusLock);
             missingSamplePath = missing;
+            lastLoadError = relinkError;
         }
 
         const auto midiTree = extra.getChildWithName ("Midi");
@@ -890,16 +1187,39 @@ namespace thf::grain
         if (! root.hasType ("thfGrain"))
             return;
 
-        // Migration hook: versions above ours are read as far as we understand them.
-        const auto version = (int) root.getProperty ("version", 1);
-        juce::ignoreUnused (version);
+        // A pending asynchronous sample load must not overwrite what the session restores.
+        ++loadGeneration;
+        loading.store (false);
 
-        const auto paramsTree = root.getChildWithName (state.state.getType());
+        const auto version = (int) root.getProperty ("version", 1);
+        switch (version)
+        {
+            // Future migrations go here, oldest first, each falling through to the next.
+            case 1:
+            default: break;
+        }
+
+        // Parameters the session does not know yet (added in later versions) start at their
+        // defaults, not at whatever the instance had before.
+        auto paramsTree = root.getChildWithName (state.state.getType()).createCopy();
         if (paramsTree.isValid())
+        {
+            for (auto* p : params)
+                if (! paramsTree.getChildWithProperty ("id", p->getParameterID()).isValid())
+                {
+                    juce::ValueTree child ("PARAM");
+                    child.setProperty ("id", p->getParameterID(), nullptr);
+                    child.setProperty ("value", p->convertFrom0to1 (p->getDefaultValue()), nullptr);
+                    paramsTree.appendChild (child, nullptr);
+                }
             state.replaceState (paramsTree);
+        }
         restoreExtraState (root.getChildWithName ("Extra"), true);
         presets.setCurrentName (root.getProperty ("preset", "Init").toString());
-        undoManager.clearUndoHistory();
+        if (juce::MessageManager::existsAndIsCurrentThread())
+            undoManager.clearUndoHistory();
+        else
+            clearHistoryPending.store (true);
     }
 
     juce::AudioProcessorEditor* GrainProcessor::createEditor()

@@ -1,6 +1,8 @@
 // DSP and processor regression tests for thf Grain.
 
 #include <PluginProcessor.h>
+#include <PluginEditor.h>
+#include <SampleLibrary.h>
 #include <i18n/Translator.h>
 #include <juce_dsp/juce_dsp.h>
 
@@ -112,6 +114,7 @@ namespace
         juce::AudioBuffer<float> buffer (2, samples);
         buffer.clear();
         p.processBlock (buffer, midi);
+        p.flushHardwareChanges();   // what the timer does ~30 times a second
     }
 }
 
@@ -364,6 +367,40 @@ public:
             expect (inside, "a grain left the region");
         }
 
+        beginTest ("Rate conversion on load: a 44.1 kHz sine keeps its pitch and stays clean");
+        {
+            juce::AudioBuffer<float> b (1, 44100);
+            for (int i = 0; i < b.getNumSamples(); ++i)
+                b.setSample (0, i, 0.5f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 1000.0 * i / 44100.0));
+            auto s = SourceData::fromBuffer (b, 44100.0, "sine", 48000.0);
+            expectEquals (s->getSampleRate(), 48000.0);
+            std::vector<float> x ((size_t) s->getLength());
+            std::copy (s->channel (0, 0), s->channel (0, 0) + s->getLength(), x.begin());
+            // Compare against an ideal 1 kHz sine at 48 kHz in the middle (edges excluded).
+            double err = 0.0, sig = 0.0;
+            for (size_t i = 4800; i + 4800 < x.size(); ++i)
+            {
+                const auto ideal = 0.5 * std::sin (2.0 * juce::MathConstants<double>::pi * 1000.0 * (double) i / 48000.0);
+                err += (x[i] - ideal) * (x[i] - ideal);
+                sig += ideal * ideal;
+            }
+            const auto snr = 10.0 * std::log10 (sig / juce::jmax (1.0e-20, err));
+            logMessage ("  44.1 -> 48 kHz: signal to error " + juce::String (snr, 1) + " dB");
+            expectGreaterThan (snr, 80.0);
+        }
+
+        beginTest ("DC is removed on load");
+        {
+            juce::AudioBuffer<float> b (1, 48000);
+            for (int i = 0; i < b.getNumSamples(); ++i)
+                b.setSample (0, i, 0.3f + 0.2f * (float) std::sin ((float) i * 0.05f));
+            auto s = SourceData::fromBuffer (b, 48000.0, "dc");
+            double mean = 0.0;
+            for (int i = 4800; i < 43200; ++i) mean += s->channel (0, 0)[i];
+            mean /= 38400.0;
+            expectLessThan (std::abs (mean), 1.0e-3);
+        }
+
         beginTest ("Pitch detection finds the note of a harmonic sample");
         {
             for (double hz : { 110.0, 220.0, 329.63, 523.25 })
@@ -413,6 +450,82 @@ public:
                 bool finite = true;
                 for (size_t i = 0; i < out.size(); ++i) finite = finite && std::isfinite (out[i]) && std::isfinite (r[i]);
                 expect (finite, "length " + juce::String (length));
+            }
+        }
+
+        beginTest ("Switching the source while notes sound does not click");
+        {
+            auto a1 = sineSource (220.0, 3.0), b1 = sineSource (330.0, 3.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (a1.get());
+            auto p = plain();
+            p.sizeMs = 80.0f; p.density = 40.0f; p.spray = 0.3f; p.chaos = 0.5f;
+            for (int n : { 48, 52, 55, 60, 64, 67, 71, 72 })
+                e.noteOn (n, 0.8f, p);
+            const auto before = render (e, p, 24000);
+            e.setSource (b1.get());
+            const auto after = render (e, p, 4800);
+            std::vector<float> joined (before.end() - 4800, before.end());
+            joined.insert (joined.end(), after.begin(), after.end());
+            const auto normalStep = maxStep (std::vector<float> (before.begin() + 4800, before.end() - 4800));
+            const auto switchStep = maxStep (joined);
+            logMessage ("  max step: steady " + juce::String (normalStep, 4) + ", around the switch " + juce::String (switchStep, 4));
+            expectLessThan (switchStep, normalStep * 1.5f);
+        }
+
+        beginTest ("After a NaN the engine recovers, reverb included");
+        {
+            auto src = sineSource (220.0, 2.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.space = 0.6f;
+            e.noteOn (60, 1.0f, p);
+            render (e, p, 4800);
+            auto broken = p;
+            broken.cutoff = std::numeric_limits<float>::quiet_NaN();
+            render (e, broken, 512);
+            const auto out = render (e, p, 9600);
+            bool finite = true;
+            for (auto v : out) finite = finite && std::isfinite (v);
+            expect (finite);
+            expectGreaterThan (rms (out, 4800), 1.0e-3);
+        }
+
+        beginTest ("Sixteen dense voices all get their grains");
+        {
+            auto src = noiseSource (4.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.voices = 16; p.density = 200.0f; p.sizeMs = 400.0f; p.spray = 1.0f; p.chaos = 1.0f;
+            for (int n = 0; n < 16; ++n)
+                e.noteOn (40 + n * 2, 0.8f, p);
+            render (e, p, 48000);
+            expectGreaterThan (e.getActiveGrains(), 16 * 40);
+        }
+
+        beginTest ("A grain longer than the region is shortened to the material");
+        {
+            auto src = noiseSource (1.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.regionStart = 0.4f; p.regionEnd = 0.45f;   // 50 ms of material
+            p.sizeMs = 1000.0f; p.density = 20.0f; p.pitch = 12.0f;
+            e.noteOn (60, 1.0f, p);
+            std::array<GrainEvent, 512> events {};
+            render (e, p, 24000);
+            const auto n = e.popGrainEvents (events.data(), (int) events.size());
+            expect (n > 0);
+            for (int k = 0; k < n; ++k)
+            {
+                expect (events[(size_t) k].position >= 0.4f - 1.0e-4f);
+                expect (events[(size_t) k].position + events[(size_t) k].span <= 0.45f + 1.0e-4f);
             }
         }
 
@@ -689,9 +802,11 @@ public:
             expect (b.getUserSample() != nullptr, "embedded sample not restored");
             if (auto s = b.getUserSample())
             {
-                expectEquals (s->getLength(), 48000);
+                // Converted to the host rate (48 kHz by default), the original rate is kept.
+                expectEquals (s->getSampleRate(), 48000.0);
+                expectEquals (s->originalRate, 44100.0);
+                expectEquals (s->getLength(), (int) std::llround (48000.0 * 48000.0 / 44100.0));
                 expectEquals (s->getNumChannels(), 2);
-                expectEquals (s->getSampleRate(), 44100.0);
                 expectEquals (s->contentHash, hash);
             }
             expect ((int) b.param (pid::source)->convertFrom0to1 (b.param (pid::source)->getValue()) == 0);
@@ -740,6 +855,286 @@ public:
             p.setUserSample (other);
             expectEquals (p.getCue (3), -1.0f);
             expectEquals (p.param (pid::regionEnd)->getValue(), 1.0f);
+        }
+
+        beginTest ("Undo: user gestures and A/B are steps; the history survives A/B");
+        {
+            GrainProcessor p;
+            auto* size = p.param (pid::size);
+            const auto original = size->getValue();
+            size->beginChangeGesture();
+            size->setValueNotifyingHost (0.9f);
+            size->endChangeGesture();
+            expect (p.getUndoManager().canUndo());
+            p.toggleAB();                                   // B = copy of A
+            size->beginChangeGesture();
+            size->setValueNotifyingHost (0.2f);
+            size->endChangeGesture();
+            p.toggleAB();                                   // back to A
+            expectWithinAbsoluteError (size->getValue(), 0.9f, 1.0e-6f);
+            expect (p.getUndoManager().canUndo(), "A/B cleared the history");
+            p.getUndoManager().undo();                      // undo the A/B switch
+            expectWithinAbsoluteError (size->getValue(), 0.2f, 1.0e-6f);
+            p.getUndoManager().undo();
+            p.getUndoManager().undo();
+            p.getUndoManager().undo();
+            expectWithinAbsoluteError (size->getValue(), original, 1.0e-6f);
+        }
+
+        beginTest ("Undo of a sample load brings back the sample, its region and cues");
+        {
+            GrainProcessor p;
+            juce::AudioBuffer<float> b (1, 48000);
+            for (int i = 0; i < b.getNumSamples(); ++i) b.setSample (0, i, 0.3f * std::sin ((float) i * 0.03f));
+            auto first = SourceData::fromBuffer (b, rate, "first");
+            first->contentHash = "first";
+            auto second = SourceData::fromBuffer (b, rate, "second");
+            second->contentHash = "second";
+            p.setUserSample (first);
+            p.param (pid::regionStart)->setValueNotifyingHost (0.25f);
+            p.setCue (2, 0.6f);
+            p.setUserSample (second);
+            expectEquals (p.getCue (2), -1.0f);
+            p.getUndoManager().undo();
+            expect (p.getUserSample() == first);
+            expectWithinAbsoluteError (p.param (pid::regionStart)->getValue(), 0.25f, 1.0e-6f);
+            expectWithinAbsoluteError (p.getCue (2), 0.6f, 1.0e-6f);
+            // Coming back to a sample later restores its cues and region too.
+            p.setUserSample (second);
+            p.setUserSample (first);
+            expectWithinAbsoluteError (p.getCue (2), 0.6f, 1.0e-6f);
+        }
+
+        beginTest ("Old sessions: parameters they do not know start at their defaults");
+        {
+            juce::MemoryBlock state;
+            {
+                GrainProcessor a;
+                a.getStateInformation (state);
+            }
+            juce::MemoryInputStream in (state, false);
+            in.readString();
+            auto root = juce::ValueTree::readFromStream (in);
+            auto paramsTree = root.getChildWithName ("PARAMS");
+            paramsTree.removeChild (paramsTree.getChildWithProperty ("id", pid::regionStart), nullptr);
+            juce::MemoryBlock old;
+            {
+                juce::MemoryOutputStream out (old, false);
+                out.writeString ("THFG");
+                root.writeToStream (out);
+            }
+            GrainProcessor b;
+            b.param (pid::regionStart)->setValueNotifyingHost (0.3f);
+            b.setStateInformation (old.getData(), (int) old.getSize());
+            expectEquals (b.param (pid::regionStart)->getValue(), 0.0f);
+        }
+
+        beginTest ("Hardware moves reach the host inside begin/end gestures");
+        {
+            struct Gestures : juce::AudioProcessorListener
+            {
+                int begins = 0, ends = 0;
+                void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override {}
+                void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails&) override {}
+                void audioProcessorParameterChangeGestureBegin (juce::AudioProcessor*, int) override { ++begins; }
+                void audioProcessorParameterChangeGestureEnd (juce::AudioProcessor*, int) override { ++ends; }
+            } gestures;
+            GrainProcessor p;
+            p.prepareToPlay (rate, 512);
+            p.addListener (&gestures);
+            juce::MidiBuffer midi;
+            for (int k = 0; k < 5; ++k) midi.addEvent (juce::MidiMessage::controllerEvent (1, 76, 65), k);
+            process (p, midi);
+            expectEquals (gestures.begins, 1);
+            expectEquals (gestures.ends, 0);
+            juce::Thread::sleep (350);
+            p.flushHardwareChanges();
+            expectEquals (gestures.ends, 1);
+            expect (p.getUndoManager().canUndo(), "a hardware move should be one undo step");
+            p.removeListener (&gestures);
+        }
+
+        beginTest ("No allocations in processBlock with the editor open");
+        {
+            GrainProcessor p;
+            waitForFactory (p);
+            p.prepareToPlay (rate, 512);
+            GrainEditor editor (p);
+            juce::MidiBuffer midi;
+            midi.ensureSize (4096);
+            juce::AudioBuffer<float> buffer (2, 512);
+            auto fill = [&midi]
+            {
+                midi.clear();
+                midi.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+                midi.addEvent (juce::MidiMessage::controllerEvent (1, 74, 65), 10);
+                midi.addEvent (juce::MidiMessage::controllerEvent (1, 82, 20), 20);
+                midi.addEvent (juce::MidiMessage::noteOn (10, 37, 0.9f), 30);
+            };
+            for (int i = 0; i < 4; ++i) { fill(); buffer.clear(); p.processBlock (buffer, midi); }
+            fill();
+            buffer.clear();
+            thf::test::allocations.store (0);
+            thf::test::countAllocations.store (true);
+            p.processBlock (buffer, midi);
+            thf::test::countAllocations.store (false);
+            expectEquals ((int) thf::test::allocations.load(), 0);
+            p.flushHardwareChanges();
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+        }
+
+        beginTest ("A late asynchronous load does not overwrite a restored session");
+        {
+            auto makeWav = [] (const char* fileName, float freq)
+            {
+                auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile (fileName);
+                juce::AudioBuffer<float> b (1, 24000);
+                for (int i = 0; i < b.getNumSamples(); ++i) b.setSample (0, i, 0.4f * std::sin ((float) i * freq));
+                juce::WavAudioFormat wav;
+                file.deleteFile();
+                std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+                if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (48000.0).withNumChannels (1).withBitsPerSample (24)))
+                    w->writeFromAudioSampleBuffer (b, 0, b.getNumSamples());
+                return file;
+            };
+            const auto fileA = makeWav ("thf-grain-test-a.wav", 0.02f);
+            const auto fileB = makeWav ("thf-grain-test-b.wav", 0.05f);
+            juce::MemoryBlock stateB;
+            juce::String hashB;
+            {
+                GrainProcessor b;
+                juce::String error;
+                expect (b.loadSampleSync (fileB, error));
+                hashB = b.getUserSample()->contentHash;
+                b.getStateInformation (stateB);
+            }
+            GrainProcessor p;
+            p.loadSampleAsync (fileA);
+            p.setStateInformation (stateB.getData(), (int) stateB.getSize());
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
+            expect (p.getUserSample() != nullptr);
+            if (p.getUserSample() != nullptr)
+                expectEquals (p.getUserSample()->contentHash, hashB);
+            fileA.deleteFile();
+            fileB.deleteFile();
+        }
+
+        beginTest ("Long samples are copied to the library and relinked only when the audio matches");
+        {
+            auto writeWav = [] (const juce::File& file, int length, double rate, float freq)
+            {
+                juce::AudioBuffer<float> b (1, length);
+                for (int i = 0; i < length; ++i) b.setSample (0, i, 0.4f * std::sin ((float) i * freq));
+                juce::WavAudioFormat wav;
+                file.deleteFile();
+                std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+                if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (1).withBitsPerSample (16)))
+                    w->writeFromAudioSampleBuffer (b, 0, length);
+            };
+            const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory);
+            const auto original = temp.getChildFile ("thf-grain-test-long.wav");
+            constexpr double rate = 8000.0;
+            const auto length = (int) (rate * (sources::maxEmbedSeconds + 1.0));
+            writeWav (original, length, rate, 0.07f);
+
+            juce::MemoryBlock state;
+            juce::File copy;
+            juce::String hash;
+            {
+                GrainProcessor p;
+                juce::String error;
+                expect (p.loadSampleSync (original, error), error);
+                auto s = p.getUserSample();
+                expect (s != nullptr && s->embeddedFlac.getSize() == 0);   // too long to embed
+                if (s != nullptr)
+                {
+                    copy = s->file;
+                    hash = s->contentHash;
+                }
+                expect (copy.isAChildOf (library::userFolder()), copy.getFullPathName());
+                expect (copy.existsAsFile());
+                p.getStateInformation (state);
+            }
+            original.deleteFile();
+
+            // The project still opens after the original is gone.
+            {
+                GrainProcessor p;
+                p.setStateInformation (state.getData(), (int) state.getSize());
+                expect (p.getUserSample() != nullptr && p.getUserSample()->contentHash == hash);
+            }
+
+            // The library copy disappears; a different file with the same name must not be used.
+            const auto tempCopy = temp.getChildFile ("thf-grain-test-long-copy.wav");
+            expect (copy.moveFileTo (tempCopy));
+            const auto impostor = library::userFolder().getChildFile (copy.getFileName());
+            writeWav (impostor, 4000, rate, 0.2f);
+            {
+                GrainProcessor p;
+                p.setStateInformation (state.getData(), (int) state.getSize());
+                expect (p.getUserSample() == nullptr);
+                expect (p.getLastLoadError().isNotEmpty());
+                expect (p.getMissingSamplePath().isNotEmpty());
+            }
+
+            // The same audio under that name is relinked.
+            impostor.deleteFile();
+            expect (tempCopy.moveFileTo (impostor));
+            {
+                GrainProcessor p;
+                p.setStateInformation (state.getData(), (int) state.getSize());
+                expect (p.getUserSample() != nullptr && p.getUserSample()->contentHash == hash);
+                expect (p.getLastLoadError().isEmpty());
+                expect (p.getMissingSamplePath().isEmpty());
+            }
+            impostor.deleteFile();
+            copy.deleteFile();
+            tempCopy.deleteFile();
+        }
+
+        beginTest ("Files over the length and memory limits are refused, not loaded");
+        {
+            // 10 min + 1 s of silence at a low rate keeps the file small.
+            const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory);
+            const auto tooLong = temp.getChildFile ("thf-grain-test-too-long.wav");
+            {
+                constexpr double rate = 1000.0;
+                juce::AudioBuffer<float> b (1, (int) (rate * (sources::maxFileSeconds + 1.0)));
+                b.clear();
+                juce::WavAudioFormat wav;
+                tooLong.deleteFile();
+                std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (tooLong);
+                if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (1).withBitsPerSample (16)))
+                    w->writeFromAudioSampleBuffer (b, 0, b.getNumSamples());
+            }
+            juce::String error;
+            expect (sources::loadFile (tooLong, error) == nullptr);
+            expect (error.containsIgnoreCase ("10 minutes"), error);
+
+            // The memory limit, scaled down so the test does not need a 256 MB file.
+            sources::LoadOptions small;
+            small.maxSamples = 1000;
+            error.clear();
+            const auto shortFile = temp.getChildFile ("thf-grain-test-over-budget.wav");
+            {
+                juce::AudioBuffer<float> b (2, 1024);
+                b.clear();
+                juce::WavAudioFormat wav;
+                shortFile.deleteFile();
+                std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (shortFile);
+                if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (48000.0).withNumChannels (2).withBitsPerSample (16)))
+                    w->writeFromAudioSampleBuffer (b, 0, b.getNumSamples());
+            }
+            expect (sources::loadFile (shortFile, error, small) == nullptr);
+            expect (error.containsIgnoreCase ("too large"), error);
+            error.clear();
+            expect (sources::loadFile (shortFile, error) != nullptr, error);
+
+            GrainProcessor p;
+            expect (! p.loadSampleSync (tooLong, error));
+            expect (p.getUserSample() == nullptr);
+            tooLong.deleteFile();
+            shortFile.deleteFile();
         }
 
         beginTest ("Factory presets load and only use known parameters");

@@ -45,15 +45,86 @@ namespace thf::grain
         }
     }
 
-    SourceData::Ptr SourceData::fromBuffer (const juce::AudioBuffer<float>& audio, double rate, const juce::String& sourceName)
+    namespace
     {
+        // Offline band-limited rate conversion with the same Kaiser sinc as HQ grains; the
+        // kernel is stretched when reducing the rate, so nothing folds back.
+        juce::AudioBuffer<float> resample (const juce::AudioBuffer<float>& in, double from, double to)
+        {
+            static const dsp::SincTable sinc;
+            const auto ratio = from / to;                            // input samples per output sample
+            const auto stretch = juce::jmax (1.0, ratio);
+            const auto reach = (int) std::ceil (dsp::SincTable::halfTaps * stretch) + 1;
+            const auto inLength = in.getNumSamples();
+            const auto outLength = juce::jmax (1, (int) std::llround ((double) inLength / ratio));
+            juce::AudioBuffer<float> out (in.getNumChannels(), outLength);
+            const auto invStretch = (float) (1.0 / stretch);
+            for (int ch = 0; ch < in.getNumChannels(); ++ch)
+            {
+                const auto* x = in.getReadPointer (ch);
+                auto* y = out.getWritePointer (ch);
+                for (int i = 0; i < outLength; ++i)
+                {
+                    const auto pos = (double) i * ratio;
+                    const auto base = (int) std::floor (pos);
+                    const auto frac = (float) (pos - base);
+                    float sum = 0.0f;
+                    for (int k = -reach + 1; k <= reach; ++k)
+                    {
+                        const auto idx = base + k;
+                        if (idx >= 0 && idx < inLength)
+                            sum += x[idx] * sinc.kernel (((float) k - frac) * invStretch);
+                    }
+                    y[i] = sum * invStretch;
+                }
+            }
+            return out;
+        }
+
+        // DC and sub-sonic rumble out: mean removed, then a 5 Hz one-pole high-pass run
+        // forwards and backwards (zero phase). Each pass starts as if the local mean of the
+        // first 20 ms had always been there, so a file that starts mid-waveform gets no
+        // decaying offset at its edges.
+        void removeDc (float* d, int n, double rate)
+        {
+            if (n < 4) return;
+            double mean = 0.0;
+            for (int i = 0; i < n; ++i) mean += d[i];
+            mean /= n;
+            for (int i = 0; i < n; ++i) d[i] -= (float) mean;
+            // Unity gain at Nyquist: g (1 - z^-1) / (1 - a z^-1) with g = (1 + a) / 2.
+            const auto a = std::exp (-2.0 * juce::MathConstants<double>::pi * 5.0 / rate);
+            const auto g = 0.5 * (1.0 + a);
+            const auto edge = juce::jlimit (1, n, (int) (rate * 0.02));
+            const auto localMean = [d, edge] (int from)
+            {
+                double sum = 0.0;
+                for (int i = from; i < from + edge; ++i) sum += d[i];
+                return sum / edge;
+            };
+            double x1 = localMean (0), y1 = 0.0;
+            for (int i = 0; i < n; ++i) { const double x = d[i]; y1 = g * (x - x1) + a * y1; x1 = x; d[i] = (float) y1; }
+            x1 = localMean (n - edge); y1 = 0.0;
+            for (int i = n - 1; i >= 0; --i) { const double x = d[i]; y1 = g * (x - x1) + a * y1; x1 = x; d[i] = (float) y1; }
+        }
+    }
+
+    SourceData::Ptr SourceData::fromBuffer (const juce::AudioBuffer<float>& input, double rate, const juce::String& sourceName,
+                                            double targetRate)
+    {
+        rate = rate > 0.0 ? rate : 48000.0;
+        const bool convert = targetRate > 0.0 && std::abs (targetRate - rate) > 0.01 && input.getNumSamples() > 0;
+        const auto converted = convert ? resample (input, rate, targetRate) : juce::AudioBuffer<float>();
+        const auto& audio = convert ? converted : input;
+
         Ptr s (new SourceData());
         s->numChannels = juce::jlimit (1, 2, audio.getNumChannels());
         s->length = juce::jmax (1, audio.getNumSamples());
-        s->sampleRate = rate > 0.0 ? rate : 48000.0;
+        s->sampleRate = convert ? targetRate : rate;
+        s->originalRate = rate;
         s->name = sourceName;
 
-        // Level 0: sanitised copy.
+        // Level 0: sanitised copy without DC.
         auto level0 = padded (s->numChannels, s->length);
         for (int ch = 0; ch < s->numChannels; ++ch)
         {
@@ -63,6 +134,7 @@ namespace thf::grain
             const auto* src = audio.getReadPointer (ch);
             for (int i = 0; i < s->length; ++i)
                 dst[i] = std::isfinite (src[i]) ? juce::jlimit (-4.0f, 4.0f, src[i]) : 0.0f;
+            removeDc (dst, s->length, s->sampleRate);
         }
         s->levels.push_back (std::move (level0));
         s->levelLengths.push_back (s->length);
@@ -155,7 +227,8 @@ namespace thf::grain
                 return *manager;
             }
 
-            SourceData::Ptr fromReader (juce::AudioFormatReader* rawReader, const juce::String& name, juce::String& error)
+            SourceData::Ptr fromReader (juce::AudioFormatReader* rawReader, const juce::String& name, juce::String& error,
+                                        const LoadOptions& options, const juce::MemoryBlock* embeddedImage)
             {
                 std::unique_ptr<juce::AudioFormatReader> reader (rawReader);
                 if (reader == nullptr)
@@ -174,12 +247,59 @@ namespace thf::grain
                     return nullptr;
                 }
                 const auto channels = juce::jlimit (1, 2, (int) reader->numChannels);
-                juce::AudioBuffer<float> audio (channels, (int) reader->lengthInSamples);
-                reader->read (&audio, 0, audio.getNumSamples(), 0, true, channels > 1);
-                auto source = SourceData::fromBuffer (audio, reader->sampleRate, name);
-                source->contentHash = hashOf (audio);
-                detectPitch (*source);
-                return source;
+                if (reader->lengthInSamples * channels > juce::jmin (options.maxSamples, maxTotalSamples))
+                {
+                    error = "The file is too large";
+                    return nullptr;
+                }
+
+                try
+                {
+                    // Read in chunks so a newer request can cancel a long load.
+                    juce::AudioBuffer<float> audio (channels, (int) reader->lengthInSamples);
+                    constexpr int chunk = 1 << 18;
+                    for (juce::int64 pos = 0; pos < reader->lengthInSamples; pos += chunk)
+                    {
+                        if (options.cancelled && options.cancelled())
+                        {
+                            error = "Cancelled";
+                            return nullptr;
+                        }
+                        const auto n = (int) juce::jmin ((juce::int64) chunk, reader->lengthInSamples - pos);
+                        reader->read (&audio, (int) pos, n, pos, true, channels > 1);
+                    }
+
+                    auto source = SourceData::fromBuffer (audio, reader->sampleRate, name, options.targetRate);
+                    source->contentHash = hashOf (audio);
+                    source->originalPeak = audio.getMagnitude (0, audio.getNumSamples());
+
+                    // The session keeps the ORIGINAL audio (not the converted one).
+                    if (options.embed && (double) reader->lengthInSamples / reader->sampleRate <= maxEmbedSeconds)
+                        source->embeddedFlac = embeddedImage != nullptr ? *embeddedImage
+                                                                        : encodeFlac (audio, reader->sampleRate);
+
+                    // Root note written by the file itself (WAV smpl / AIFF INST) wins over analysis.
+                    const auto& meta = reader->metadataValues;
+                    if (meta.containsKey ("MidiUnityNote"))
+                    {
+                        const auto unity = meta.getValue ("MidiUnityNote", "60").getIntValue();
+                        const auto fraction = (double) meta.getValue ("MidiPitchFraction", "0").getLargeIntValue() / 4294967296.0;
+                        if (unity > 0 && unity < 128)
+                        {
+                            source->detectedNote = (float) (unity + fraction);
+                            source->pitchConfidence = 1.0f;
+                            source->pitchFromFile = true;
+                        }
+                    }
+                    if (! source->pitchFromFile)
+                        detectPitch (*source);
+                    return source;
+                }
+                catch (const std::bad_alloc&)
+                {
+                    error = "Not enough memory for this file";
+                    return nullptr;
+                }
             }
 
             constexpr double genRate = 48000.0;
@@ -532,18 +652,20 @@ namespace thf::grain
             return extensions.joinIntoString (";");
         }
 
-        SourceData::Ptr loadFile (const juce::File& file, juce::String& error)
+        SourceData::Ptr loadFile (const juce::File& file, juce::String& error, const LoadOptions& options)
         {
-            auto source = fromReader (formats().createReaderFor (file), file.getFileName(), error);
+            auto source = fromReader (formats().createReaderFor (file), file.getFileName(), error, options, nullptr);
             if (source != nullptr)
                 source->file = file;
             return source;
         }
 
-        SourceData::Ptr loadFromMemory (const void* data, size_t size, const juce::String& name, juce::String& error)
+        SourceData::Ptr loadFromMemory (const void* data, size_t size, const juce::String& name, juce::String& error,
+                                        const LoadOptions& options)
         {
+            const juce::MemoryBlock image (data, size);
             auto stream = std::make_unique<juce::MemoryInputStream> (data, size, false);
-            return fromReader (formats().createReaderFor (std::move (stream)), name, error);
+            return fromReader (formats().createReaderFor (std::move (stream)), name, error, options, &image);
         }
 
         juce::MemoryBlock encodeFlac (const juce::AudioBuffer<float>& audio, double sampleRate)
@@ -583,22 +705,24 @@ namespace thf::grain
             return SourceData::fromBuffer (audio, genRate, "");
         }
 
-        void detectPitch (SourceData& s)
+        PitchEstimate estimatePitch (const SourceData& s, float start01, float end01)
         {
+            PitchEstimate result;
             // YIN (de Cheveigné & Kawahara) on up to 8 of the loudest 46 ms windows of the
             // mono mix; the median of confident estimates wins.
             const auto rate = s.getSampleRate();
             const int window = juce::nextPowerOfTwo ((int) (0.046 * rate));
             const int maxLag = juce::jmin (window - 2, (int) (rate / 40.0));    // down to 40 Hz
             const int minLag = juce::jmax (2, (int) (rate / 2000.0));           // up to 2 kHz
-            const auto length = s.getLength();
+            const auto first = juce::jlimit (0, s.getLength(), (int) (juce::jmin (start01, end01) * (float) s.getLength()));
+            const auto length = juce::jlimit (0, s.getLength() - first, (int) (std::abs (end01 - start01) * (float) s.getLength()));
             if (length < 2 * window)
-                return;
+                return result;
 
             std::vector<float> mono ((size_t) length);
             for (int ch = 0; ch < s.getNumChannels(); ++ch)
             {
-                const auto* d = s.channel (0, ch);
+                const auto* d = s.channel (0, ch) + first;
                 for (int i = 0; i < length; ++i) mono[(size_t) i] += d[i];
             }
 
@@ -648,13 +772,21 @@ namespace thf::grain
                 confidenceSum += 1.0f - b;
             }
             if (notes.size() < 3)
-                return;
+                return result;
             std::sort (notes.begin(), notes.end());
             const auto median = notes[notes.size() / 2];
             int agreeing = 0;
             for (auto note : notes) if (std::abs (note - median) < 0.5f) ++agreeing;
-            s.detectedNote = median;
-            s.pitchConfidence = juce::jlimit (0.0f, 1.0f, (confidenceSum / (float) notes.size()) * (float) agreeing / (float) notes.size());
+            result.note = median;
+            result.confidence = juce::jlimit (0.0f, 1.0f, (confidenceSum / (float) notes.size()) * (float) agreeing / (float) notes.size());
+            return result;
+        }
+
+        void detectPitch (SourceData& s)
+        {
+            const auto estimate = estimatePitch (s);
+            s.detectedNote = estimate.note;
+            s.pitchConfidence = estimate.confidence;
         }
 
         juce::String hashOf (const juce::AudioBuffer<float>& audio)

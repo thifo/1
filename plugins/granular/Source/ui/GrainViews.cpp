@@ -472,7 +472,9 @@ namespace thf::grain
             auto ch = std::make_unique<Choice>();
             ch->paramId = id;
             auto* p = dynamic_cast<juce::AudioParameterChoice*> (ctx.processor.param (id));
-            ch->box.addItemList (p->choices, 1);
+            for (int i = 0; i < p->choices.size(); ++i)          // real entries only
+                if (p->choices[i] != reservedChoiceName)
+                    ch->box.addItem (p->choices[i], i + 1);
             ch->attachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (ctx.processor.getState(), id, ch->box);
             ch->label.setText (p->getName (32), juce::dontSendNotification);
             styleLabel (ch->label, ctx.lookAndFeel, 12.5f, true, glassText);

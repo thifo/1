@@ -52,9 +52,12 @@ namespace thf::grain
                                [] (float v) { return juce::String (v * 100.0f, 1) + " %"; });
         }
 
-        auto choiceParam (const char* id, const char* name, const juce::StringArray& choices, int def)
+        auto choiceParam (const char* id, const char* name, const juce::StringArray& choices, int def, int reserveTo = 0)
         {
-            return std::make_unique<juce::AudioParameterChoice> (juce::ParameterID (id, version), name, choices, def);
+            auto list = choices;
+            while (list.size() < reserveTo)
+                list.add (reservedChoiceName);
+            return std::make_unique<juce::AudioParameterChoice> (juce::ParameterID (id, version), name, list, def);
         }
 
         auto boolParam (const char* id, const char* name, bool def)
@@ -73,7 +76,7 @@ namespace thf::grain
         juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
         // Source and grains
-        layout.add (choiceParam (pid::source, "Source", sourceChoices, 1));
+        layout.add (choiceParam (pid::source, "Source", sourceChoices, 1, reservedSources));
         layout.add (std::make_unique<juce::AudioParameterInt> (
             juce::ParameterID (pid::root, version), "Root", 0, 127, 60,
             juce::AudioParameterIntAttributes().withStringFromValueFunction ([] (int v, int) { return noteName (v); })));
@@ -90,7 +93,7 @@ namespace thf::grain
         layout.add (floatParam (pid::size, "Size", logRange (5.0f, 2000.0f, 120.0f), 120.0f, formatTime));
         layout.add (floatParam (pid::density, "Density", logRange (0.5f, 200.0f, 20.0f), 24.0f, formatHz));
         layout.add (boolParam (pid::sync, "Sync", false));
-        layout.add (choiceParam (pid::syncRate, "Sync Rate", syncRateChoices, 3));
+        layout.add (choiceParam (pid::syncRate, "Sync Rate", syncRateChoices, 3, reservedRates));
         layout.add (percentParam (pid::chaos, "Chaos", 0.3f));
         layout.add (percentParam (pid::window, "Window", 0.0f));
         layout.add (floatParam (pid::pitch, "Pitch", Range (-24.0f, 24.0f, 1.0f), 0.0f,
@@ -101,7 +104,7 @@ namespace thf::grain
                                 [] (float v) { return juce::String (v, 2) + " st"; }));
         layout.add (percentParam (pid::reverse, "Reverse", 0.0f));
         layout.add (percentParam (pid::stereo, "Stereo", 0.5f));
-        layout.add (choiceParam (pid::quantize, "Pitch Quantize", quantizeChoices, 0));
+        layout.add (choiceParam (pid::quantize, "Pitch Quantize", quantizeChoices, 0, reservedQuantize));
 
         // Voices
         layout.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID (pid::voices, version), "Voices", 1, 16, 8));
@@ -116,7 +119,7 @@ namespace thf::grain
         layout.add (floatParam (pid::release, "Release", logRange (1.0f, 20000.0f, 800.0f), 800.0f, formatTime));
 
         // Tone
-        layout.add (choiceParam (pid::filterType, "Filter Type", filterChoices, 0));
+        layout.add (choiceParam (pid::filterType, "Filter Type", filterChoices, 0, reservedFilters));
         layout.add (floatParam (pid::cutoff, "Cutoff", logRange (20.0f, 20000.0f, 1000.0f), 20000.0f, formatHz));
         layout.add (percentParam (pid::resonance, "Resonance", 0.1f));
         layout.add (floatParam (pid::filterEnv, "Filter Env", Range (-1.0f, 1.0f), 0.0f,
@@ -127,12 +130,12 @@ namespace thf::grain
         // Modulation
         layout.add (floatParam (pid::lfoRate, "LFO Rate", logRange (0.01f, 20.0f, 1.0f), 0.5f, formatHz));
         layout.add (percentParam (pid::lfoDepth, "LFO Depth", 0.0f));
-        layout.add (choiceParam (pid::lfoShape, "LFO Shape", lfoShapeChoices, 0));
-        layout.add (choiceParam (pid::lfoTarget, "LFO Target", modTargetChoices, 0));
-        layout.add (choiceParam (pid::modTarget, "Mod Target", modTargetChoices, 1));
+        layout.add (choiceParam (pid::lfoShape, "LFO Shape", lfoShapeChoices, 0, reservedShapes));
+        layout.add (choiceParam (pid::lfoTarget, "LFO Target", modTargetChoices, 0, reservedTargets));
+        layout.add (choiceParam (pid::modTarget, "Mod Target", modTargetChoices, 1, reservedTargets));
         layout.add (percentParam (pid::modDepth, "Mod Depth", 0.5f));
         layout.add (choiceParam (pid::lfoMode, "LFO Mode", lfoModeChoices, 0));
-        layout.add (choiceParam (pid::lfoDivision, "LFO Division", lfoDivisionChoices, 4));
+        layout.add (choiceParam (pid::lfoDivision, "LFO Division", lfoDivisionChoices, 4, reservedDivisions));
 
         // Space
         layout.add (percentParam (pid::space, "Space", 0.0f));
