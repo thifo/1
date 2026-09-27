@@ -71,6 +71,7 @@ namespace thf::grain
         inline constexpr const char* safeClip   = "safeClip";
         inline constexpr const char* hq         = "hq";
         inline constexpr const char* linkVoices = "linkVoices";
+        inline constexpr const char* scanLoop   = "scanLoop";
     }
 
     // Choice lists (order is part of the saved state: append only). Hosts store automation of a
@@ -80,6 +81,7 @@ namespace thf::grain
     inline const juce::StringArray sourceChoices   { "Sample", "Saw Pad", "Voice", "Bell", "Noise", "Glass",
                                                      "Vocal Phrase", "Chord Stack", "Pluck", "Keys" };
     inline const juce::StringArray scanModeChoices { "Global", "Per Note" };
+    inline const juce::StringArray scanLoopChoices { "Loop", "Ping-Pong", "Once" };
     inline const juce::StringArray syncRateChoices { "1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/64" };
     inline const juce::StringArray voiceModeChoices{ "Poly", "Mono", "Legato" };
     inline const juce::StringArray filterChoices   { "Low Pass", "Band Pass", "High Pass" };

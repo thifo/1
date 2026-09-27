@@ -63,6 +63,36 @@ namespace thf::grain
         return best;
     }
 
+    double GrainEngine::mapPlayhead (double x, int scanLoop) noexcept
+    {
+        switch (scanLoop)
+        {
+            case 1:  { const auto t = x - 2.0 * std::floor (x * 0.5); return t <= 1.0 ? t : 2.0 - t; }   // ping-pong
+            case 2:  return juce::jlimit (0.0, 1.0, x);                                                    // once
+            default: return wrap01 (x);                                                                    // loop
+        }
+    }
+
+    double GrainEngine::advanceScan (double scan, double step, int scanLoop) noexcept
+    {
+        scan += step;
+        switch (scanLoop)
+        {
+            case 1:  return scan - 2.0 * std::floor (scan * 0.5);     // the fold does the rest
+            case 2:  return juce::jlimit (-2.0, 2.0, scan);
+            default: return wrap01 (scan);
+        }
+    }
+
+    void GrainEngine::noteOnAt (int id, int pitchNote, float velocity, float anchor, const EngineParams& p)
+    {
+        nextPitch = pitchNote;
+        nextAnchor = juce::jlimit (0.0f, 1.0f, anchor);
+        noteOn (id, velocity, p);
+        nextPitch = -1;
+        nextAnchor = -1.0f;
+    }
+
     void GrainEngine::reset()
     {
         rng.setSeed (seed_);
@@ -91,7 +121,7 @@ namespace thf::grain
         monoCount = 0;
         noteCounter = 0;
         sustainPedal = holdOn = false;
-        bend = modWheel = 0.0f;
+        bend = modWheel = pressure = 0.0f;
         driveSmoothed = 0.0f;
         gainSmoothed = -1.0f;      // "not initialised": the first block jumps to the target
         resonanceSmoothed = -1.0f;
@@ -213,8 +243,9 @@ namespace thf::grain
         v.filter[0].reset();
         v.filter[1].reset();
         v.scanOffset = 0.0;
-        v.targetNote = (float) note;
-        v.currentNote = glideFromPrevious ? previousNote : (float) note;
+        v.targetNote = pitchFor (note);
+        v.currentNote = glideFromPrevious ? previousNote : v.targetNote;
+        v.anchor = nextAnchor;
         v.firstBlock = true;
         v.pendingNote = -1;
         v.energy = v.energySmoothed = v.powerSmoothed = 0.0f;
@@ -304,20 +335,22 @@ namespace thf::grain
             if (v.active && ! v.amp.isReleasing() && p.voiceMode == 2)
             {
                 v.note = note;
-                v.targetNote = (float) note;
+                v.targetNote = pitchFor (note);
+                v.anchor = nextAnchor;
                 v.keyDown = true;
-                if (p.glideMs <= 0.0f) v.currentNote = (float) note;
+                if (p.glideMs <= 0.0f) v.currentNote = v.targetNote;
             }
             else if (v.active && v.amp.getStage() != dsp::Adsr::Stage::steal)
             {
                 // Mono retrigger from the current level: no reset, no click.
                 v.note = note;
-                v.targetNote = (float) note;
+                v.targetNote = pitchFor (note);
+                v.anchor = nextAnchor;
                 v.keyDown = true;
                 v.sustained = false;
                 v.velocityGain = gain;
                 v.order = ++noteCounter;
-                if (p.glideMs <= 0.0f) v.currentNote = (float) note;
+                if (p.glideMs <= 0.0f) v.currentNote = v.targetNote;
                 v.amp.gateOn();
                 v.filterEnv.trigger();
             }
@@ -339,6 +372,8 @@ namespace thf::grain
         {
             v.amp.steal (stealSamples (v.note));
             v.pendingNote = note;
+            v.pendingPitch = nextPitch;
+            v.pendingAnchor = nextAnchor;
             v.pendingVelocityGain = gain;
             v.pendingKeyDown = true;
         }
@@ -491,11 +526,14 @@ namespace thf::grain
         // Position, spray and scan are relative to the region; grains stay inside it when they fit.
         const auto regionStart = juce::jlimit (0.0, 1.0, (double) juce::jmin (p.regionStart, p.regionEnd));
         const auto regionLength = juce::jmax (1.0e-3, juce::jlimit (0.0, 1.0, (double) juce::jmax (p.regionStart, p.regionEnd)) - regionStart);
-        const auto scanOffset = p.perNoteScan ? v.scanOffset : globalScan;
+        // A voice with its own position (cue pad) scans from there on its own.
+        const bool anchored = v.anchor >= 0.0f;
+        const auto scanOffset = p.perNoteScan || anchored ? v.scanOffset : globalScan;
         const auto spray = juce::jlimit (0.0f, 1.0f, p.spray + modulation.spray);
-        // The playhead wraps around the region; the spray around it reflects at the edges so
-        // no grains pile up on the boundary.
-        auto relative = (double) wrap01 ((double) p.position + modulation.position + scanOffset) + d.spray * spray;
+        const auto base = anchored ? (double) v.anchor : (double) p.position + modulation.position;
+        // The playhead loops, folds or stops at the region's end (Scan Loop); the spray around
+        // it reflects at the edges so no grains pile up on the boundary.
+        auto relative = mapPlayhead (base + scanOffset, p.scanLoop) + d.spray * spray;
         if (relative < 0.0) relative = -relative;
         if (relative > 1.0) relative = 2.0 - relative;
         relative = juce::jlimit (0.0, 1.0, relative);
@@ -572,14 +610,15 @@ namespace thf::grain
             }
         };
         apply (p.lfoTarget, lfoValue * p.lfoDepth);
-        apply (p.modTarget, modWheel * p.modDepth);
+        const auto modAmount = juce::jmax (modWheel, pressure);
+        apply (p.modTarget, modAmount * p.modDepth);
 
         // Level: the LFO ducks from full level (LFO at +1) down by its depth (LFO at -1):
         // a rising saw gives the classic pump on every cycle. The mod strip just turns down.
         if (p.lfoTarget == 6)
             modulation.level *= 1.0f - p.lfoDepth * 0.5f * (1.0f - lfoValue);
         if (p.modTarget == 6)
-            modulation.level *= 1.0f - modWheel * p.modDepth;
+            modulation.level *= 1.0f - modAmount * p.modDepth;
 
         const auto smooth20ms = 1.0f - std::exp (-(float) n / (0.02f * sr));
         const auto smooth5ms = 1.0f - std::exp (-(float) n / (0.005f * sr));
@@ -593,14 +632,14 @@ namespace thf::grain
             const auto regionLength = juce::jmax (1.0e-3f, std::abs (p.regionEnd - p.regionStart));
             scanStep = (double) p.scan * source->getSampleRate() / (sampleRate * source->getLength() * regionLength) * n;
         }
-        globalScan = wrap01 (globalScan + scanStep);
+        globalScan = advanceScan (globalScan, scanStep, p.scanLoop);
 
         shape = computeShape (p);
         linkSeed = rng.next() | 1u;
         const auto gap = [this, &p] { return (double) ((1.0f - p.chaos) + p.chaos * rng.exponential()); };
 
         int activeVoices = 0;
-        float newestOffset = -1.0f;
+        float newestOffset = -1.0f, newestAnchor = -1.0f;
         uint64_t newestOrder = 0;
         for (int vi = 0; vi < maxVoices; ++vi)
         {
@@ -614,8 +653,13 @@ namespace thf::grain
             else
                 v.currentNote = v.targetNote;
 
-            v.scanOffset = wrap01 (v.scanOffset + scanStep);
-            if (v.order > newestOrder) { newestOrder = v.order; newestOffset = (float) v.scanOffset; }
+            v.scanOffset = advanceScan (v.scanOffset, scanStep, p.scanLoop);
+            if (v.order > newestOrder)
+            {
+                newestOrder = v.order;
+                newestOffset = (float) v.scanOffset;
+                newestAnchor = v.anchor;
+            }
 
             // Only the knob position is smoothed; the envelope moves the cutoff directly so
             // its attack stays sharp.
@@ -707,8 +751,9 @@ namespace thf::grain
 
         beatClock += n * juce::jmax (1.0, p.bpm) / (60.0 * sampleRate);
 
-        const auto shownScan = p.perNoteScan && newestOffset >= 0.0f ? (double) newestOffset : globalScan;
-        playheadForUi.store (wrap01 ((double) p.position + shownScan), std::memory_order_relaxed);
+        const auto shownScan = (p.perNoteScan || newestAnchor >= 0.0f) && newestOffset >= 0.0f ? (double) newestOffset : globalScan;
+        const auto shownBase = newestAnchor >= 0.0f ? (double) newestAnchor : (double) p.position;
+        playheadForUi.store ((float) mapPlayhead (shownBase + shownScan, p.scanLoop), std::memory_order_relaxed);
         activeVoicesForUi.store (activeVoices, std::memory_order_relaxed);
     }
 
@@ -862,7 +907,13 @@ namespace thf::grain
                 if (! v.amp.isActive())
                 {
                     if (v.pendingNote >= 0)
+                    {
+                        nextPitch = v.pendingPitch;
+                        nextAnchor = v.pendingAnchor;
                         startVoice (v, v.pendingNote, v.pendingVelocityGain, v.pendingKeyDown, p);
+                        nextPitch = -1;
+                        nextAnchor = -1.0f;
+                    }
                     else
                     {
                         v.active = false;

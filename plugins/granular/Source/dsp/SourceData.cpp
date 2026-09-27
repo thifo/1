@@ -1,4 +1,5 @@
 #include "SourceData.h"
+#include <juce_dsp/juce_dsp.h>
 #include "DspCore.h"
 #include <thread>
 
@@ -195,8 +196,194 @@ namespace thf::grain
             s->peakMin[(size_t) b] = lo;
             s->peakMax[(size_t) b] = hi;
         }
+        s->buildPyramid();
+        detectOnsetsInto (*s);
         return s;
     }
+
+    void SourceData::buildPyramid()
+    {
+        // Level 0 from the samples (every other sample of copy 0 = the source rate), then
+        // each level from the one below.
+        for (size_t l = 0; l < pyramidMin.size(); ++l)
+        {
+            const auto block = pyramidBlocks[l];
+            const auto count = (length + block - 1) / block;
+            pyramidMin[l].assign ((size_t) count, 0.0f);
+            pyramidMax[l].assign ((size_t) count, 0.0f);
+            for (int b = 0; b < count; ++b)
+            {
+                float lo = 0.0f, hi = 0.0f;
+                if (l == 0)
+                {
+                    for (int ch = 0; ch < numChannels; ++ch)
+                        for (int i = b * block; i < juce::jmin (length, (b + 1) * block); ++i)
+                        {
+                            const auto v = sample (ch, i);
+                            lo = juce::jmin (lo, v);
+                            hi = juce::jmax (hi, v);
+                        }
+                }
+                else
+                {
+                    const auto ratio = block / pyramidBlocks[l - 1];
+                    for (int k = b * ratio; k < juce::jmin ((int) pyramidMin[l - 1].size(), (b + 1) * ratio); ++k)
+                    {
+                        lo = juce::jmin (lo, pyramidMin[l - 1][(size_t) k]);
+                        hi = juce::jmax (hi, pyramidMax[l - 1][(size_t) k]);
+                    }
+                }
+                pyramidMin[l][(size_t) b] = lo;
+                pyramidMax[l][(size_t) b] = hi;
+            }
+        }
+    }
+
+    void SourceData::getPeaks (double start, double end, int buckets, float* mins, float* maxs) const
+    {
+        const auto first = start * length, span = juce::jmax (1.0e-9, (end - start) * length);
+        for (int b = 0; b < buckets; ++b)
+        {
+            const auto a = (int) std::floor (first + span * b / buckets);
+            const auto z = juce::jmax (a + 1, (int) std::floor (first + span * (b + 1) / buckets));
+            float lo = 0.0f, hi = 0.0f;
+            const auto width = z - a;
+            // The coarsest pyramid level with at least two blocks per column.
+            int level = -1;
+            for (int l = (int) pyramidMin.size() - 1; l >= 0; --l)
+                if (pyramidBlocks[l] * 2 <= width) { level = l; break; }
+            if (level < 0)
+            {
+                for (int ch = 0; ch < numChannels; ++ch)
+                    for (int i = juce::jmax (0, a); i < juce::jmin (length, z); ++i)
+                    {
+                        const auto v = sample (ch, i);
+                        lo = juce::jmin (lo, v);
+                        hi = juce::jmax (hi, v);
+                    }
+            }
+            else
+            {
+                const auto block = pyramidBlocks[level];
+                const auto& pmin = pyramidMin[(size_t) level];
+                const auto& pmax = pyramidMax[(size_t) level];
+                for (int k = juce::jmax (0, a / block); k < juce::jmin ((int) pmin.size(), (z + block - 1) / block); ++k)
+                {
+                    lo = juce::jmin (lo, pmin[(size_t) k]);
+                    hi = juce::jmax (hi, pmax[(size_t) k]);
+                }
+            }
+            mins[b] = lo;
+            maxs[b] = hi;
+        }
+    }
+
+    int SourceData::nearestZeroCrossing (int index, int radius) const
+    {
+        auto mono = [this] (int i)
+        {
+            float v = 0.0f;
+            for (int ch = 0; ch < numChannels; ++ch) v += sample (ch, i);
+            return v;
+        };
+        index = juce::jlimit (0, juce::jmax (0, length - 1), index);
+        for (int d = 0; d <= radius; ++d)
+            for (int i : { index - d, index + d })
+            {
+                if (i < 0 || i + 1 >= length)
+                    continue;
+                const auto a = mono (i), b = mono (i + 1);
+                if ((a <= 0.0f) != (b <= 0.0f))
+                    return std::abs (a) <= std::abs (b) ? i : i + 1;
+            }
+        return index;
+    }
+
+    // Attacks by spectral flux (1024-point frames, hop 256, log magnitudes), peaks above an
+    // adaptive threshold, each refined in time to the steepest rise of the waveform envelope.
+    void detectOnsetsInto (SourceData& s)
+    {
+        s.onsets.clear();
+        const auto n = s.getLength();
+        constexpr int order = 10, size = 1 << order, hop = 256;
+        if (n < size)
+            return;
+        auto mono = [&s] (int i)
+        {
+            float v = 0.0f;
+            for (int ch = 0; ch < s.getNumChannels(); ++ch) v += s.sample (ch, i);
+            return v;
+        };
+
+        juce::dsp::FFT fft (order);
+        std::vector<float> window ((size_t) size), data ((size_t) 2 * size), previous ((size_t) size / 2 + 1, 0.0f);
+        for (int i = 0; i < size; ++i)
+            window[(size_t) i] = 0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi * (float) i / (float) size);
+
+        const auto frames = n / hop + 1;
+        std::vector<float> flux ((size_t) frames, 0.0f);
+        for (int f = 0; f < frames; ++f)
+        {
+            const auto start = f * hop - size / 2;
+            std::fill (data.begin(), data.end(), 0.0f);
+            for (int i = 0; i < size; ++i)
+                if (start + i >= 0 && start + i < n)
+                    data[(size_t) i] = mono (start + i) * window[(size_t) i];
+            fft.performFrequencyOnlyForwardTransform (data.data());
+            float sum = 0.0f;
+            for (int k = 1; k <= size / 2; ++k)
+            {
+                const auto m = std::log1p (100.0f * data[(size_t) k]);
+                sum += juce::jmax (0.0f, m - previous[(size_t) k]);
+                previous[(size_t) k] = m;
+            }
+            flux[(size_t) f] = sum;
+        }
+
+        double total = 0.0;
+        float maxFlux = 0.0f;
+        for (auto v : flux) { total += v; maxFlux = juce::jmax (maxFlux, v); }
+        const auto globalMean = (float) (total / frames);
+        // Frames that run past the end see the cut, not an attack.
+        const auto lastFrame = (n - size / 2) / hop;
+        const int minGap = juce::jmax (1, (int) (0.03 * s.getSampleRate() / hop));
+        int lastPeak = -minGap;
+        for (int f = 1; f + 1 < frames; ++f)
+        {
+            float local = 0.0f;
+            int count = 0;
+            for (int k = juce::jmax (0, f - 8); k <= juce::jmin (frames - 1, f + 8); ++k) { local += flux[(size_t) k]; ++count; }
+            local /= (float) count;
+            const auto v = flux[(size_t) f];
+            bool isPeak = f <= lastFrame && v > 1.5f * local + 0.5f * globalMean && v >= 0.05f * maxFlux
+                          && f - lastPeak >= minGap;
+            for (int k = juce::jmax (0, f - 2); isPeak && k <= juce::jmin (frames - 1, f + 2); ++k)
+                if (k != f && flux[(size_t) k] > v) isPeak = false;
+            if (! isPeak)
+                continue;
+            lastPeak = f;
+
+            // Refine: the steepest rise of a 32-sample peak envelope anywhere in the frame.
+            const auto centre = f * hop;
+            auto envelope = [&] (int i)
+            {
+                float m = 0.0f;
+                for (int k = i; k < juce::jmin (n, i + 32); ++k) m = juce::jmax (m, std::abs (mono (k)));
+                return m;
+            };
+            int best = centre;
+            float bestRise = -1.0f;
+            for (int i = juce::jmax (64, centre - size / 2); i < juce::jmin (n, centre + size / 2); i += 4)
+            {
+                const auto rise = envelope (i) - envelope (i - 64);
+                if (rise > bestRise) { bestRise = rise; best = i; }
+            }
+            // Step back to the first sample of that rise.
+            for (int k = 0; k < 4 && best > 0 && envelope (best - 1) >= envelope (best) * 0.999f; ++k) --best;
+            s.onsets.push_back ({ juce::jlimit (0, n - 1, best + 16), v });
+        }
+    }
+
 
     namespace sources
     {
@@ -280,8 +467,31 @@ namespace thf::grain
                             source->pitchFromFile = true;
                         }
                     }
+                    // Then a note in the file name ("Vox F#3", "Pad Fmin"), then analysis.
                     if (! source->pitchFromFile)
-                        detectPitch (*source);
+                    {
+                        const auto named = rootFromName (name);
+                        if (named.midiNote >= 0)
+                        {
+                            source->detectedNote = (float) named.midiNote;
+                            source->pitchConfidence = 1.0f;
+                            source->pitchFromFile = true;
+                        }
+                        else
+                        {
+                            detectPitch (*source);
+                            if (named.pitchClass >= 0)
+                            {
+                                // Key without an octave: that pitch class, in the octave nearest
+                                // to what the analysis heard (or around C3).
+                                const auto heard = source->detectedNote >= 0.0f ? source->detectedNote : 60.0f;
+                                auto note = (float) named.pitchClass + 12.0f * std::round ((heard - (float) named.pitchClass) / 12.0f);
+                                source->detectedNote = juce::jlimit (0.0f, 127.0f, note);
+                                source->pitchConfidence = 1.0f;
+                                source->pitchFromFile = true;
+                            }
+                        }
+                    }
                     return source;
                 }
                 catch (const std::bad_alloc&)
@@ -767,6 +977,53 @@ namespace thf::grain
             for (auto note : notes) if (std::abs (note - median) < 0.5f) ++agreeing;
             result.note = median;
             result.confidence = juce::jlimit (0.0f, 1.0f, (confidenceSum / (float) notes.size()) * (float) agreeing / (float) notes.size());
+            return result;
+        }
+
+        NameRoot rootFromName (const juce::String& fileName)
+        {
+            NameRoot result;
+            // Name without folder and extension (not via juce::File: names need not be paths).
+            auto stem = fileName.fromLastOccurrenceOf ("/", false, false).fromLastOccurrenceOf ("\\", false, false);
+            if (const auto dot = stem.lastIndexOfChar ('.'); dot > 0 && stem.length() - dot <= 5
+                                                              && stem.substring (dot + 1).containsOnly ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"))
+                stem = stem.substring (0, dot);
+            const auto tokens = juce::StringArray::fromTokens (stem.replaceCharacters ("_-.()[]", "       "), " ", "");
+            for (const auto& token : tokens)
+            {
+                const auto t = token.trim();
+                if (t.isEmpty()) continue;
+                static const int base[] = { 9, 11, 0, 2, 4, 5, 7 };   // A B C D E F G
+                const auto letter = juce::CharacterFunctions::toUpperCase (t[0]);
+                if (letter < 'A' || letter > 'G') continue;
+                auto rest = t.substring (1);
+                int pitch = base[letter - 'A'];
+                bool marked = false;                 // accidental, octave or key suffix present
+                if (rest.startsWith ("#")) { ++pitch; rest = rest.substring (1); marked = true; }
+                else if (rest.startsWith ("b") && ! rest.startsWithIgnoreCase ("bpm")) { --pitch; rest = rest.substring (1); marked = true; }
+                int octave = -100;
+                if (rest.isNotEmpty() && (juce::CharacterFunctions::isDigit (rest[0]) || (rest[0] == '-' && rest.length() > 1)))
+                {
+                    int i = rest[0] == '-' ? 1 : 0;
+                    while (i < rest.length() && juce::CharacterFunctions::isDigit (rest[i])) ++i;
+                    octave = rest.substring (0, i).getIntValue();
+                    rest = rest.substring (i);
+                    if (octave < -2 || octave > 8) continue;
+                    marked = true;
+                }
+                const auto suffix = rest.toLowerCase();
+                if (suffix == "m" || suffix == "min" || suffix == "minor" || suffix == "maj" || suffix == "major")
+                    marked = true;
+                else if (suffix.isNotEmpty())
+                    continue;                        // a word that starts with a note letter
+                if (! marked)
+                    continue;
+                pitch = (pitch + 12) % 12;
+                result.pitchClass = pitch;
+                if (octave > -100)
+                    result.midiNote = juce::jlimit (0, 127, pitch + 12 * (octave + 2));
+                return result;
+            }
             return result;
         }
 

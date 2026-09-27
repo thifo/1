@@ -166,8 +166,10 @@ namespace thf::grain
         void changeVelocity (int delta);
         void setPadChannel (int channel);
         std::function<void()> onSettingsChanged;
+        std::function<void (int note)> onRootPick;      // Alt-click on a key
 
         bool keyPressed (const juce::KeyPress&) override;
+        bool mouseDownOnKey (int midiNoteNumber, const juce::MouseEvent&) override;
         void drawWhiteNote (int note, juce::Graphics&, juce::Rectangle<float>, bool isDown, bool isOver,
                             juce::Colour lineColour, juce::Colour textColour) override;
         void drawBlackNote (int note, juce::Graphics&, juce::Rectangle<float>, bool isDown, bool isOver,

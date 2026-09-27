@@ -4,6 +4,33 @@
 
 namespace thf::grain
 {
+    namespace
+    {
+        // Cue positions (0..1 of the region) at the eight strongest attacks inside the
+        // region, in time order; -1 for the rest.
+        std::array<float, 8> cuesFromAttacks (const SourceData& s, float regionStart, float regionEnd)
+        {
+            std::array<float, 8> result;
+            result.fill (-1.0f);
+            const auto lo = juce::jmin (regionStart, regionEnd), hi = juce::jmax (regionStart, regionEnd);
+            const auto length = (float) juce::jmax (1, s.getLength());
+            std::vector<SourceData::Onset> inside;
+            for (const auto& o : s.getOnsets())
+            {
+                const auto where = (float) o.position / length;
+                if (where >= lo && where < hi)
+                    inside.push_back (o);
+            }
+            std::sort (inside.begin(), inside.end(), [] (auto& a, auto& b) { return a.strength > b.strength; });
+            if (inside.size() > result.size())
+                inside.resize (result.size());
+            std::sort (inside.begin(), inside.end(), [] (auto& a, auto& b) { return a.position < b.position; });
+            for (size_t i = 0; i < inside.size(); ++i)
+                result[i] = juce::jlimit (0.0f, 1.0f, ((float) inside[i].position / length - lo) / juce::jmax (1.0e-6f, hi - lo));
+            return result;
+        }
+    }
+
     //==============================================================================
     FactorySources::FactorySources()
     {
@@ -70,6 +97,7 @@ namespace thf::grain
             lfoDepth = get (pid::lfoDepth); lfoShape = get (pid::lfoShape); lfoTarget = get (pid::lfoTarget);
             modTarget = get (pid::modTarget); modDepth = get (pid::modDepth); output = get (pid::output);
             safeClip = get (pid::safeClip); hq = get (pid::hq); linkVoices = get (pid::linkVoices);
+            scanLoop = get (pid::scanLoop);
         }
 
         std::atomic<float> *source, *root, *position, *scan, *scanMode, *freeze, *spray, *size, *density,
@@ -78,7 +106,7 @@ namespace thf::grain
             *filterType, *cutoff, *resonance, *filterEnv, *filterDecay, *drive, *lfoRate, *lfoDepth,
             *lfoShape, *lfoTarget, *modTarget, *modDepth, *output, *safeClip, *hq,
             *quantize, *lfoMode, *lfoDivision, *space, *spaceSize, *regionStart, *regionEnd, *normalize,
-            *linkVoices;
+            *linkVoices, *scanLoop;
     };
 
     //==============================================================================
@@ -185,6 +213,7 @@ namespace thf::grain
         p.normalizeSource = r.normalize->load() > 0.5f;
         p.scan = r.scan->load();
         p.perNoteScan = r.scanMode->load() > 0.5f;
+        p.scanLoop = juce::jlimit (0, scanLoopChoices.size() - 1, (int) r.scanLoop->load());
         p.freeze = r.freeze->load() > 0.5f;
         p.spray = r.spray->load();
         p.sizeMs = r.size->load();
@@ -273,6 +302,14 @@ namespace thf::grain
         if (scanResetRequested.exchange (false))
             engine.resetScan();
 
+        // Pads pressed on screen, handled here like the hardware ones.
+        for (auto r = uiPadRead.load (std::memory_order_relaxed); r != uiPadWrite.load (std::memory_order_acquire); ++r)
+        {
+            const auto e = uiPads[r % uiPads.size()];
+            pressPad (e.pad, e.down, clockSeconds(), e.velocity);
+            uiPadRead.store (r + 1, std::memory_order_release);
+        }
+
         // Adds notes played on the on-screen / computer keyboard and records incoming ones
         // so the keyboard lights up.
         keyboardState.processNextMidiBuffer (midiMessages, 0, numSamples, true);
@@ -302,6 +339,7 @@ namespace thf::grain
         }
         renderTo (numSamples);
         midiMessages.clear();
+        renderPreview (buffer, numSamples);
 
         for (int ch = 2; ch < buffer.getNumChannels(); ++ch)
             buffer.clear (ch, 0, numSamples);
@@ -329,12 +367,12 @@ namespace thf::grain
                 using namespace layout::minilab3;
                 if (note >= padBankANote && note < padBankANote + layout::numPads)
                 {
-                    pressPad (note - padBankANote, m.isNoteOn(), clockSeconds());
+                    pressPad (note - padBankANote, m.isNoteOn(), clockSeconds(), m.getFloatVelocity());
                     return;
                 }
                 if (note >= padBankBNote && note < padBankBNote + layout::numPads)
                 {
-                    pressPad (layout::numPads + note - padBankBNote, m.isNoteOn(), clockSeconds());
+                    pressPad (layout::numPads + note - padBankBNote, m.isNoteOn(), clockSeconds(), m.getFloatVelocity());
                     return;
                 }
             }
@@ -350,6 +388,18 @@ namespace thf::grain
             const auto v = (float) (m.getPitchWheelValue() - 8192) / 8192.0f;
             engine.setPitchBend (juce::jlimit (-1.0f, 1.0f, v));
             pitchStrip.store (juce::jlimit (0.0f, 1.0f, 0.5f + 0.5f * v));
+            return;
+        }
+
+        // Aftertouch and pad pressure modulate like the mod strip.
+        if (m.isChannelPressure())
+        {
+            engine.setPressure ((float) m.getChannelPressureValue() / 127.0f);
+            return;
+        }
+        if (m.isAftertouch())
+        {
+            engine.setPressure ((float) m.getAfterTouchValue() / 127.0f);
             return;
         }
 
@@ -566,7 +616,8 @@ namespace thf::grain
                 mainTurnedWhileHeld = true;
                 return true;
             }
-            // Position: 0.1 % of the region per tick when turned slowly, up to 2 % when spun.
+            // Position: 0.1 % of the region per tick when turned slowly, up to 2 % when spun
+            // (a cue pad held down: that cue moves instead).
             const auto now = clockSeconds();
             if (mainLastTick >= 0.0 && now - mainLastTick < 0.3)
             {
@@ -579,6 +630,12 @@ namespace thf::grain
             }
             mainLastTick = now;
             const auto acceleration = juce::jlimit (1.0, 20.0, 1.0 + std::pow (juce::jmax (0.0, mainSpeed - 8.0) / 12.0, 1.5));
+            if (const auto cue = cueHeld.load(); cue >= 0 && cues[(size_t) cue].load() >= 0.0f)
+            {
+                cues[(size_t) cue].store (juce::jlimit (0.0f, 1.0f, cues[(size_t) cue].load() + (float) (ticks * 0.001 * acceleration)));
+                cueDeleted[(size_t) cue] = true;         // moved: the release must not store over it
+                return true;
+            }
             auto* p = mainEncoderSlot;
             setParamFromAudio (p, currentValue (p) + (float) (ticks * 0.001 * acceleration));
             touched (p, cc);
@@ -628,7 +685,7 @@ namespace thf::grain
         return false;
     }
 
-    void GrainProcessor::pressPad (int pad, bool down, double now)
+    void GrainProcessor::pressPad (int pad, bool down, double now, float velocity)
     {
         if (pad < 0 || pad >= 2 * layout::numPads)
             return;
@@ -640,10 +697,13 @@ namespace thf::grain
 
         if (pad >= layout::numPads)
         {
-            // Bank B: cues. Empty pad: store on release. Filled pad: jump on press; holding
-            // for 0.6 s overwrites it with the position the playhead had before the jump.
+            // Bank B: cues. Empty pad: store on release. Filled pad: plays the sample from its
+            // cue (Root, pad velocity) while held, or, with cue pads not playing, jumps
+            // Position there; holding 0.6 s then overwrites it with where the playhead was.
             const auto i = (size_t) (pad - layout::numPads);
             auto* position = positionParam;
+            const bool play = cuePadsPlay.load();
+            const auto id = 200 + (int) i;              // engine note id of this pad's voice
             if (down)
             {
                 padPressTime[(size_t) pad] = now;
@@ -652,23 +712,36 @@ namespace thf::grain
                 cueHeld.store ((int) i);
                 if (const auto cue = cues[i].load(); cue >= 0.0f)
                 {
-                    setParamFromAudio (position, cue);
-                    engine.resetScan();
+                    if (play)
+                    {
+                        const auto p = makeEngineParams();
+                        engine.noteOnAt (id, p.root, velocity, cue, p);
+                    }
+                    else
+                    {
+                        setParamFromAudio (position, cue);
+                        engine.resetScan();
+                    }
                 }
             }
             else
             {
                 cueHeld.store (-1);
+                if (play)
+                    engine.noteOff (id, makeEngineParams());
                 if (cueDeleted[i])
                     return;
                 const bool empty = cues[i].load() < 0.0f;
-                const bool longPress = now - padPressTime[(size_t) pad] >= overwriteAfter;
+                const bool longPress = ! play && now - padPressTime[(size_t) pad] >= overwriteAfter;
                 if (empty || longPress)
                 {
                     const auto where = cuePressPlayhead[i];
                     cues[i].store (where);
-                    setParamFromAudio (position, where);
-                    engine.resetScan();
+                    if (! play)
+                    {
+                        setParamFromAudio (position, where);
+                        engine.resetScan();
+                    }
                 }
             }
             return;
@@ -737,6 +810,153 @@ namespace thf::grain
         }
     }
 
+    void GrainProcessor::sliceCuesFromAttacks()
+    {
+        const auto s = getUserSample();
+        if (s == nullptr)
+            return;
+        const auto before = captureSnapshot (false);
+        const auto sliced = cuesFromAttacks (*s, param (pid::regionStart)->getValue(), param (pid::regionEnd)->getValue());
+        for (size_t i = 0; i < cues.size(); ++i)
+            cues[i].store (sliced[i]);
+        recordChange ("Slice", before);
+    }
+
+    bool GrainProcessor::trimToRegion (juce::String& error)
+    {
+        const auto s = getUserSample();
+        if (s == nullptr)
+            return false;
+        const auto a = juce::jmin (param (pid::regionStart)->getValue(), param (pid::regionEnd)->getValue());
+        const auto b = juce::jmax (param (pid::regionStart)->getValue(), param (pid::regionEnd)->getValue());
+        if (b - a >= 0.999f)
+            return false;
+
+        // The original audio: the embedded copy, or the file.
+        std::unique_ptr<juce::AudioFormatReader> reader;
+        juce::AudioFormatManager formats;
+        formats.registerBasicFormats();
+        if (s->embeddedFlac.getSize() > 0)
+            reader.reset (formats.createReaderFor (std::make_unique<juce::MemoryInputStream> (s->embeddedFlac, false)));
+        else if (s->file.existsAsFile())
+            reader.reset (formats.createReaderFor (s->file));
+        if (reader == nullptr)
+        {
+            error = "The original audio is not available";
+            return false;
+        }
+        const auto total = reader->lengthInSamples;
+        const auto first = (juce::int64) std::floor (a * (double) total);
+        const auto count = (int) juce::jmax ((juce::int64) 1, (juce::int64) std::ceil (b * (double) total) - first);
+        juce::AudioBuffer<float> part ((int) juce::jlimit (1u, 2u, reader->numChannels), count);
+        reader->read (&part, 0, count, first, true, part.getNumChannels() > 1);
+
+        // Kept as a file of its own next to the user's samples.
+        auto folder = library::userFolder().getChildFile ("Library");
+        folder.createDirectory();
+        const auto base = s->getName().isNotEmpty() ? s->getName() : juce::String ("Sample");
+        const auto file = folder.getNonexistentChildFile (base + " (trim)", ".wav");
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+            auto writer = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (reader->sampleRate)
+                                                           .withNumChannels (part.getNumChannels()).withBitsPerSample (32)
+                                                           .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint));
+            if (writer == nullptr || ! writer->writeFromAudioSampleBuffer (part, 0, count))
+            {
+                error = "Could not write the trimmed file";
+                return false;
+            }
+        }
+
+        // Same cues (they are relative to the region, which becomes the whole sample).
+        std::array<float, 8> keptCues {};
+        for (size_t i = 0; i < cues.size(); ++i) keptCues[i] = cues[i].load();
+        if (! loadSampleSync (file, error))
+            return false;
+        for (size_t i = 0; i < cues.size(); ++i) cues[i].store (keptCues[i]);
+        for (auto [id, value] : { std::pair { pid::regionStart, 0.0f }, std::pair { pid::regionEnd, 1.0f } })
+        {
+            auto* p = param (id);
+            p->beginChangeGesture();
+            p->setValueNotifyingHost (value);
+            p->endChangeGesture();
+        }
+        return true;
+    }
+
+    void GrainProcessor::pressPadFromUi (int pad, bool down, float velocity)
+    {
+        const auto w = uiPadWrite.load (std::memory_order_relaxed);
+        if (w - uiPadRead.load (std::memory_order_acquire) >= (uint32_t) uiPads.size())
+            return;
+        uiPads[w % uiPads.size()] = { pad, down, velocity };
+        uiPadWrite.store (w + 1, std::memory_order_release);
+    }
+
+    void GrainProcessor::previewFile (const juce::File& file)
+    {
+        // Loaded in the background at the host rate; the audio thread picks it up.
+        const auto generation = ++loadGeneration;
+        std::weak_ptr<bool> token = alive;
+        auto options = loadOptions (0);
+        options.embed = false;
+        previewLoader.addJob ([this, file, options, token, generation]
+        {
+            juce::String error;
+            auto s = sources::loadFile (file, error, options);
+            juce::MessageManager::callAsync ([this, s, token, generation]
+            {
+                if (token.expired() || s == nullptr || generation != loadGeneration.load())
+                    return;
+                previewRetired.push_back (previewHeld);
+                previewHeld = s;
+                previewPending.store (s.get());
+                previewRequest.fetch_add (1);
+            });
+        });
+    }
+
+    void GrainProcessor::stopPreview()
+    {
+        previewRetired.push_back (previewHeld);
+        previewHeld = nullptr;
+        previewPending.store (nullptr);
+        previewRequest.fetch_add (1);
+    }
+
+    void GrainProcessor::renderPreview (juce::AudioBuffer<float>& buffer, int numSamples)
+    {
+        if (const auto request = previewRequest.load (std::memory_order_acquire); request != previewSeen.load (std::memory_order_relaxed))
+        {
+            previewPlaying = previewPending.load();
+            previewPosition = 0.0;
+            previewSeen.store (request, std::memory_order_release);
+        }
+        previewActive.store (previewPlaying != nullptr);
+        if (previewPlaying == nullptr)
+            return;
+        // Copy 0 holds two samples per sample of the source, which runs at the host rate.
+        const auto* s = previewPlaying;
+        const auto gain = 0.5f * s->getNormalGain();
+        for (int ch = 0; ch < juce::jmin (2, buffer.getNumChannels()); ++ch)
+        {
+            const auto* d = s->channel (0, ch);
+            auto* out = buffer.getWritePointer (ch);
+            for (int i = 0; i < numSamples; ++i)
+            {
+                const auto index = (int) previewPosition + i;
+                if (index >= s->getLength())
+                    break;
+                const auto fade = juce::jmin (1.0f, (float) (s->getLength() - index) / 256.0f);
+                out[i] += d[2 * index] * gain * fade;
+            }
+        }
+        previewPosition += numSamples;
+        if (previewPosition >= s->getLength())
+            previewPlaying = nullptr;
+    }
+
     void GrainProcessor::setEncoderMode (midi::EncoderMode m)
     {
         encoderMode.store ((int) m);
@@ -765,7 +985,10 @@ namespace thf::grain
         const auto current = getUserSample();
         const auto from = current != nullptr && current->file.existsAsFile() ? current->file
                                                                              : library::userFolder().getChildFile ("-");
-        const auto next = library::neighbour (from, delta);
+        // Several files dropped together form the list; otherwise the folder of the sample.
+        auto next = library::neighbour (from, delta);
+        if (const auto index = browseList.indexOf (from); index >= 0 && browseList.size() > 1)
+            next = browseList[((index + delta) % browseList.size() + browseList.size()) % browseList.size()];
         if (next.existsAsFile())
             loadSampleAsync (next);
     }
@@ -877,6 +1100,8 @@ namespace thf::grain
             next.cues.fill (-1.0f);
             if (auto it = sampleMemory.find (s->contentHash); it != sampleMemory.end())
                 next = it->second;
+            else
+                next.cues = cuesFromAttacks (*s, 0.0f, 1.0f);   // a new sample: cues on its attacks
             for (size_t i = 0; i < cues.size(); ++i) cues[i].store (next.cues[i]);
             for (auto [id, value] : { std::pair { pid::regionStart, next.regionStart }, std::pair { pid::regionEnd, next.regionEnd } })
             {
@@ -1175,6 +1400,10 @@ namespace thf::grain
         if (const auto steps = browseRequest.exchange (0); steps != 0)
             browseSamples (steps);
 
+        // A replaced preview can go once the audio thread has moved on.
+        if (! previewRetired.empty() && previewSeen.load() == previewRequest.load())
+            previewRetired.clear();
+
         if (encoderSettingsDirty.exchange (false))
             library::writeSetting ("grainEncoderMode", juce::String (encoderAuto.load() ? "auto:" : "manual:")
                                                            + juce::String (encoderMode.load()));
@@ -1234,6 +1463,7 @@ namespace thf::grain
             midiTree.setProperty ("encoderMode", encoderMode.load(), nullptr);
             midiTree.setProperty ("padsAsControls", padsAsControls.load(), nullptr);
             midiTree.setProperty ("padChannel", padChannel.load(), nullptr);
+            midiTree.setProperty ("cuePadsPlay", cuePadsPlay.load(), nullptr);
             midiTree.setProperty ("page", page.load(), nullptr);
             for (int cc = 0; cc < 128; ++cc)
                 if (const auto index = learned[(size_t) cc].load(); index >= 0)
@@ -1313,6 +1543,7 @@ namespace thf::grain
         {
             padsAsControls.store ((bool) midiTree.getProperty ("padsAsControls", true));
             padChannel.store (juce::jlimit (1, 16, (int) midiTree.getProperty ("padChannel", layout::minilab3::padChannel)));
+            cuePadsPlay.store ((bool) midiTree.getProperty ("cuePadsPlay", true));
             page.store (juce::jlimit (0, layout::numPages - 1, (int) midiTree.getProperty ("page", 0)));
             for (auto& l : learned) l.store (-1);
             for (const auto& m : midiTree)

@@ -132,6 +132,7 @@ namespace thf::grain
         layout.add (floatParam (pid::scan, "Scan", Range (-2.0f, 2.0f), 0.0f,
                                 [] (float v) { return juce::String (v, 2) + "x"; }));
         layout.add (choiceParam (pid::scanMode, "Scan Mode", scanModeChoices, 0));
+        layout.add (choiceParam (pid::scanLoop, "Scan Loop", scanLoopChoices, 0, 8));
         layout.add (boolParam (pid::freeze, "Freeze", false));
         layout.add (floatParam (pid::spray, "Spray", logRange (0.0f, 1.0f, 0.1f), 0.04f,
                                 [] (float v) { return juce::String (v * 100.0f, v < 0.1f ? 2 : 1) + " %"; }));

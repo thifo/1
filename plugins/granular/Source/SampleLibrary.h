@@ -24,6 +24,11 @@ namespace thf::grain::library
     // folder (and one level below) and in the folders of recent samples.
     juce::File findMissing (const juce::File& original);
 
+    // Favourite samples (any folder), newest first.
+    juce::Array<juce::File> favourites();
+    bool isFavourite (const juce::File&);
+    void setFavourite (const juce::File&, bool);
+
     // Per-user settings shared by every instance (thf.settings). Message thread.
     juce::String readSetting (const juce::String& key);
     void writeSetting (const juce::String& key, const juce::String& value);

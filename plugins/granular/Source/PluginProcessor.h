@@ -90,6 +90,25 @@ namespace thf::grain
 
         // Cue points 0..1, -1 = empty.
         float getCue (int index) const noexcept     { return cues[(size_t) index].load(); }
+        // Cues at the eight strongest attacks inside the region, in time order.
+        void sliceCuesFromAttacks();
+        // Replaces the sample by the part inside the region (a new file in the library; one
+        // undo step brings the whole sample back). Message thread.
+        bool trimToRegion (juce::String& error);
+        // Pads of the Cues bank play the sample from their cue (Root, velocity) instead of
+        // only moving Position. Session setting.
+        bool getCuePadsPlay() const noexcept        { return cuePadsPlay.load(); }
+        void setCuePadsPlay (bool b)                { cuePadsPlay.store (b); }
+        // Pads pressed on screen: queued and handled on the audio thread like the hardware.
+        void pressPadFromUi (int pad, bool down, float velocity);
+        // Files to step through with < > and the main encoder (several dropped at once).
+        void setBrowseList (const juce::Array<juce::File>& files) { browseList = files; }
+        const juce::Array<juce::File>& getBrowseList() const noexcept { return browseList; }
+        void stepSample (int delta)                 { browseSamples (delta); }
+        // Listen to a file without loading it (played once at its own pitch). Message thread.
+        void previewFile (const juce::File&);
+        void stopPreview();
+        bool isPreviewing() const noexcept          { return previewActive.load(); }
         void setCue (int index, float value)        { cues[(size_t) index].store (value); }
         void jumpToCue (int index);
         // Restart scanning from Position (thread-safe; applied at the next block).
@@ -104,7 +123,7 @@ namespace thf::grain
         // (press and release come from the same source). Bank A: a tap toggles, holding a
         // toggle pad makes it momentary. Bank B: tap an empty pad to store, tap to jump,
         // hold 0.6 s to overwrite; pad held + main encoder click deletes the cue.
-        void pressPad (int pad, bool down, double now);
+        void pressPad (int pad, bool down, double now, float velocity = 0.8f);
         static constexpr double momentaryAfter = 0.3, overwriteAfter = 0.6;
 
         // Bank A pad function (0-7), as a tap on the pad. Any thread.
@@ -287,6 +306,23 @@ namespace thf::grain
         // Pads: press times, values before a press (momentary), last non-zero amounts.
         std::array<double, 16> padPressTime {};
         std::array<juce::RangedAudioParameter*, 8> padParams {};   // bank A, cached (no lookups on audio)
+        std::atomic<bool> cuePadsPlay { true };
+        std::array<float, 16> padVelocity {};
+        struct PadEvent { int pad = 0; bool down = false; float velocity = 0.8f; };
+        std::array<PadEvent, 64> uiPads {};
+        std::atomic<uint32_t> uiPadWrite { 0 }, uiPadRead { 0 };
+        juce::Array<juce::File> browseList;                       // message thread
+
+        // Preview: the audio thread plays `previewPlaying`, handed over by generation.
+        SourceData::Ptr previewHeld;                              // message thread
+        std::vector<SourceData::Ptr> previewRetired;              // until the audio thread moved on
+        std::atomic<SourceData*> previewPending { nullptr };
+        std::atomic<uint32_t> previewRequest { 0 }, previewSeen { 0 };
+        std::atomic<bool> previewActive { false };
+        SourceData* previewPlaying = nullptr;                     // audio thread
+        double previewPosition = 0.0;
+        juce::ThreadPool previewLoader { 1 };
+        void renderPreview (juce::AudioBuffer<float>&, int numSamples);
         std::array<float, 8> padValueBefore {};
         std::array<float, 8> padLastAmount { 1, 1, 1, 1, 1, 1, 1, 1 };
         std::atomic<int> cueHeld { -1 };

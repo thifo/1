@@ -3,6 +3,7 @@
 #include <PluginProcessor.h>
 #include <PluginEditor.h>
 #include <SampleLibrary.h>
+#include <ui/WaveformMath.h>
 #include <i18n/Translator.h>
 #include <juce_dsp/juce_dsp.h>
 #include <map>
@@ -593,6 +594,122 @@ public:
 
         }
 
+        beginTest ("Attacks: 8 of 8 clicks found within 2 ms");
+        {
+            juce::AudioBuffer<float> b (1, (int) rate * 4);
+            juce::Random r (7);
+            for (int i = 0; i < b.getNumSamples(); ++i) b.setSample (0, i, 0.002f * (r.nextFloat() - 0.5f));
+            std::vector<int> clicks;
+            for (int k = 0; k < 8; ++k)
+            {
+                const auto at = (int) (rate * (0.2 + 0.43 * k)) + 37 * k;
+                clicks.push_back (at);
+                for (int i = 0; i < 300; ++i)       // short decaying burst
+                    b.setSample (0, at + i, b.getSample (0, at + i) + 0.8f * std::exp (-(float) i / 60.0f) * (i % 2 == 0 ? 1.0f : -1.0f));
+            }
+            auto s = SourceData::fromBuffer (b, rate, "clicks");
+            int found = 0;
+            for (auto c : clicks)
+                for (const auto& o : s->getOnsets())
+                    if (std::abs (o.position - c) <= (int) (0.002 * rate)) { ++found; break; }
+            logMessage ("  onsets " + juce::String ((int) s->getOnsets().size()) + ", clicks matched " + juce::String (found));
+            expectEquals (found, 8);
+            expectEquals ((int) s->getOnsets().size(), 8);
+        }
+
+        beginTest ("Zero-crossing snap lands within one sample");
+        {
+            auto s = sineSource (100.0, 1.0);      // zero crossings every 240 samples
+            for (int target : { 2400, 4800, 7200 })
+            {
+                const auto found = s->nearestZeroCrossing (target + 57, 200);
+                expect (std::abs (found - target) <= 1, juce::String (target) + " -> " + juce::String (found));
+            }
+        }
+
+        beginTest ("Zoom and region: 50 ms on a 10-minute sample");
+        {
+            const double seconds = 600.0, length = seconds * rate;
+            const auto target = 0.05 / seconds;
+            expect (wave::minimumRegion (seconds, rate) <= target);
+            expect (wave::minimumViewSpan (length) <= target);
+            wave::View v;
+            for (int i = 0; i < 40; ++i) v = wave::zoomAround (v, 0.3, 0.7, wave::minimumViewSpan (length));
+            expect (v.span() <= target && v.start <= 0.3 && v.end >= 0.3);
+            const auto start = 0.3, end = wave::clampHandle (0.3 + target, start, false, wave::minimumRegion (seconds, rate));
+            expectWithinAbsoluteError (end - start, target, 1.0e-9);
+        }
+
+        beginTest ("Root from the file name");
+        {
+            auto midi = [] (const char* file) { return sources::rootFromName (file).midiNote; };
+            auto pitchClass = [] (const char* file) { return sources::rootFromName (file).pitchClass; };
+            expectEquals (midi ("Vox Chop 92bpm F#3.wav"), 66);
+            expectEquals (midi ("pad_F#3"), 66);
+            expectEquals (midi ("Lead C4.aif"), 72);
+            expectEquals (midi ("bass-Bb2"), 58);
+            expectEquals (pitchClass ("Chords_Fmin.wav"), 5);
+            expectEquals (midi ("Chords_Fmin.wav"), -1);
+            expectEquals (pitchClass ("Bass.wav"), -1);
+            expectEquals (pitchClass ("A Cappella.wav"), -1);
+            expectEquals (pitchClass ("Drum Loop 120.wav"), -1);
+        }
+
+        beginTest ("Scan Loop: loop, ping-pong, once");
+        {
+            expectWithinAbsoluteError (GrainEngine::mapPlayhead (1.25, 0), 0.25, 1.0e-9);
+            expectWithinAbsoluteError (GrainEngine::mapPlayhead (1.25, 1), 0.75, 1.0e-9);
+            expectWithinAbsoluteError (GrainEngine::mapPlayhead (2.25, 1), 0.25, 1.0e-9);
+            expectWithinAbsoluteError (GrainEngine::mapPlayhead (1.25, 2), 1.0, 1.0e-9);
+            expectWithinAbsoluteError (GrainEngine::mapPlayhead (-0.25, 1), 0.25, 1.0e-9);
+        }
+
+        beginTest ("Cue pads: a note plays from its own position");
+        {
+            auto src = noiseSource (4.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.sizeMs = 50.0f;
+            p.position = 0.8f;                         // Position elsewhere
+            e.noteOnAt (200, 60, 1.0f, 0.3f, p);
+            GrainEvent ev[64];
+            std::vector<float> l (256), r (256);
+            e.render (l.data(), r.data(), 256, p);
+            const auto n = e.popGrainEvents (ev, 64);
+            expect (n > 0);
+            const auto length = (double) src->getLength();
+            for (int i = 0; i < n; ++i)
+            {
+                // Same mapping as Position: starts spread over the region minus the grain.
+                const auto expected = 0.3 * (1.0 - ev[i].span) * length;
+                if (ev[i].time == 0 && i == 0)
+                    expect (std::abs (ev[i].position * length - expected) <= 1.0, juce::String (ev[i].position * length) + " vs " + juce::String (expected));
+            }
+            e.noteOff (200, p);
+        }
+
+        beginTest ("Pressure modulates like the mod strip");
+        {
+            auto src = noiseSource (4.0);
+            auto level = [&src] (float pressure)
+            {
+                GrainEngine e;
+                e.prepare (rate);
+                e.setSource (src.get());
+                auto p = plain();
+                p.spray = 1.0f; p.chaos = 1.0f; p.density = 60.0f;
+                p.modTarget = 6; p.modDepth = 1.0f;     // Level
+                e.setPressure (pressure);
+                e.noteOn (60, 1.0f, p);
+                return rms (render (e, p, (int) rate), (size_t) rate / 4);
+            };
+            const auto db = juce::Decibels::gainToDecibels (level (0.5f) / level (0.0f));
+            logMessage ("  pressure 0.5 on Level: " + juce::String (db, 1) + " dB");
+            expectWithinAbsoluteError (db, -6.0, 0.5);
+        }
+
         beginTest ("Grain boundaries do not click (Hann and flat windows)");
         {
             auto src = sineSource (220.0, 4.0);
@@ -1059,6 +1176,7 @@ public:
             process (p, midi = {});
             expectEquals (p.getEngine().getActiveVoices(), 1);
 
+            p.setCuePadsPlay (false);                                              // cue pads move Position
             p.param (pid::position)->setValueNotifyingHost (0.3f);
             process (p, midi = {});
             midi.clear();
@@ -1245,6 +1363,7 @@ public:
 
             juce::MemoryBlock state;
             juce::String hash;
+            float cue0 = 0.0f;
             {
                 GrainProcessor a;
                 juce::String error;
@@ -1253,6 +1372,7 @@ public:
                 a.param (pid::size)->setValueNotifyingHost (0.7f);
                 a.param (pid::cutoff)->setValueNotifyingHost (0.4f);
                 a.setCue (2, 0.42f);
+                cue0 = a.getCue (0);                   // placed on an attack, or none
                 a.startLearn (pid::chaos);
                 juce::MidiBuffer midi;
                 midi.addEvent (juce::MidiMessage::controllerEvent (1, 21, 0), 0);
@@ -1267,7 +1387,7 @@ public:
             expectWithinAbsoluteError (b.param (pid::size)->getValue(), 0.7f, 1.0e-6f);
             expectWithinAbsoluteError (b.param (pid::cutoff)->getValue(), 0.4f, 1.0e-6f);
             expectWithinAbsoluteError (b.getCue (2), 0.42f, 1.0e-5f);
-            expectEquals (b.getCue (0), -1.0f);
+            expectEquals (b.getCue (0), cue0);
             expectEquals (b.getCcFor (pid::chaos), 21);
             expect (b.getUserSample() != nullptr, "embedded sample not restored");
             if (auto s = b.getUserSample())
@@ -1607,6 +1727,61 @@ public:
             shortFile.deleteFile();
         }
 
+        beginTest ("Trim to region, undo brings the whole sample back; favourites; preview");
+        {
+            const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("thf-grain-test-trim.wav");
+            {
+                juce::AudioBuffer<float> b (1, 48000 * 2);
+                for (int i = 0; i < b.getNumSamples(); ++i) b.setSample (0, i, 0.4f * std::sin ((float) i * 0.03f));
+                juce::WavAudioFormat wav;
+                file.deleteFile();
+                std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+                if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (48000.0).withNumChannels (1).withBitsPerSample (24)))
+                    w->writeFromAudioSampleBuffer (b, 0, b.getNumSamples());
+            }
+            GrainProcessor p;
+            p.prepareToPlay (rate, 512);
+            juce::String error;
+            expect (p.loadSampleSync (file, error), error);
+            const auto wholeHash = p.getUserSample()->contentHash;
+            p.param (pid::regionStart)->setValueNotifyingHost (0.25f);
+            p.param (pid::regionEnd)->setValueNotifyingHost (0.5f);
+            p.setCue (1, 0.6f);
+            expect (p.trimToRegion (error), error);
+            auto trimmed = p.getUserSample();
+            expect (trimmed != nullptr && std::abs (trimmed->getLength() - 24000) <= 2);
+            expectWithinAbsoluteError (p.param (pid::regionStart)->getValue(), 0.0f, 1.0e-6f);
+            expectWithinAbsoluteError (p.param (pid::regionEnd)->getValue(), 1.0f, 1.0e-6f);
+            expectWithinAbsoluteError (p.getCue (1), 0.6f, 1.0e-6f);
+            p.getUndoManager().undo();
+            expect (p.getUserSample() != nullptr && p.getUserSample()->contentHash == wholeHash);
+            expectWithinAbsoluteError (p.param (pid::regionStart)->getValue(), 0.25f, 1.0e-6f);
+            if (trimmed != nullptr) trimmed->file.deleteFile();
+
+            library::setFavourite (file, true);
+            expect (library::isFavourite (file));
+            library::setFavourite (file, false);
+            expect (! library::isFavourite (file));
+
+            // Preview: sound without a note.
+            p.previewFile (file);
+            for (int i = 0; i < 100 && ! p.isPreviewing(); ++i)
+            {
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (10);
+                juce::MidiBuffer midi;
+                juce::AudioBuffer<float> buffer (2, 512);
+                buffer.clear();
+                p.processBlock (buffer, midi);
+            }
+            juce::MidiBuffer midi;
+            juce::AudioBuffer<float> buffer (2, 512);
+            buffer.clear();
+            p.processBlock (buffer, midi);
+            expect (p.isPreviewing() && buffer.getMagnitude (0, 0, 512) > 0.01f);
+            p.stopPreview();
+            file.deleteFile();
+        }
+
         beginTest ("Factory presets load and only use known parameters");
         {
             GrainProcessor p;
@@ -1666,7 +1841,7 @@ public:
             for (auto page : layout::pageNames) keys.addIfNotAlreadyThere (juce::String (std::string (page)));
             for (auto& pad : layout::padsBankA) keys.addIfNotAlreadyThere (juce::String (std::string (pad.label)));
             for (auto* list : { &sourceChoices, &scanModeChoices, &voiceModeChoices, &filterChoices, &lfoShapeChoices,
-                                &modTargetChoices, &quantizeChoices, &lfoModeChoices })
+                                &modTargetChoices, &quantizeChoices, &lfoModeChoices, &scanLoopChoices })
                 for (auto& c : *list) keys.addIfNotAlreadyThere (c);
             for (auto& preset : factoryPresets()) keys.addIfNotAlreadyThere (preset.category);
             // Help lines: { "what", "how" } pairs.

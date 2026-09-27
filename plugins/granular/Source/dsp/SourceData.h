@@ -53,6 +53,18 @@ namespace thf::grain
         const std::vector<float>& getPeakMin() const noexcept { return peakMin; }
         const std::vector<float>& getPeakMax() const noexcept { return peakMax; }
 
+        // Min/max of all channels between start and end (0..1 of the sample), `buckets`
+        // columns, for a zoomed waveform: blocks of a peak pyramid, raw samples up close.
+        void getPeaks (double start, double end, int buckets, float* mins, float* maxs) const;
+
+        // Attacks (sample positions at the source's rate), in time order, with their strength.
+        struct Onset { int position = 0; float strength = 0.0f; };
+        const std::vector<Onset>& getOnsets() const noexcept { return onsets; }
+
+        // The zero crossing of the mono mix closest to `index`, within `radius` samples
+        // (index itself if there is none).
+        int nearestZeroCrossing (int index, int radius) const;
+
         // Metadata carried alongside, not used by the audio thread.
         juce::File file;
         juce::String contentHash;
@@ -72,6 +84,11 @@ namespace thf::grain
         std::vector<juce::AudioBuffer<float>> levels;
         std::vector<int> levelLengths;
         std::vector<float> peakMin, peakMax;
+        static constexpr int pyramidBlocks[] = { 16, 256, 4096 };
+        std::array<std::vector<float>, 3> pyramidMin, pyramidMax;
+        std::vector<Onset> onsets;
+        void buildPyramid();
+        friend void detectOnsetsInto (SourceData&);
         float normalGain = 1.0f;
     };
 
@@ -122,5 +139,10 @@ namespace thf::grain
         // Fills detectedNote / pitchConfidence from the whole sample (unless the file's own
         // metadata already did).
         void detectPitch (SourceData&);
+
+        // A root note written in a file name: "Vox F#3.wav" (note and octave, C3 = 60),
+        // "Pad_Fmin.wav" or "Bb.wav" (pitch class only). Bare letters are not notes.
+        struct NameRoot { int pitchClass = -1; int midiNote = -1; };   // -1 = none
+        NameRoot rootFromName (const juce::String& fileName);
     }
 }

@@ -122,4 +122,29 @@ namespace thf::grain::library
         settings->setValue (key, value);
         settings->saveIfNeeded();
     }
+
+    juce::Array<juce::File> favourites()
+    {
+        juce::Array<juce::File> files;
+        for (const auto& path : juce::StringArray::fromLines (readSetting ("grainFavourites")))
+            if (path.isNotEmpty() && juce::File::isAbsolutePath (path) && isAudioFile (juce::File (path)))
+                files.add (juce::File (path));
+        return files;
+    }
+
+    bool isFavourite (const juce::File& f)
+    {
+        return favourites().contains (f);
+    }
+
+    void setFavourite (const juce::File& f, bool on)
+    {
+        juce::StringArray paths;
+        if (on && f.existsAsFile())
+            paths.add (f.getFullPathName());
+        for (const auto& existing : favourites())
+            if (existing != f)
+                paths.add (existing.getFullPathName());
+        writeSetting ("grainFavourites", paths.joinIntoString ("\n"));
+    }
 }

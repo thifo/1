@@ -150,6 +150,16 @@ namespace thf::grain
         // Keys: on screen, and from the computer keyboard.
         content.addAndMakeVisible (keyboard);
         keyboard.onSettingsChanged = [this] { content.repaint (footerArea); };
+        keyboard.onRootPick = [this] (int note)
+        {
+            // Alt-click on a key: that note becomes Root.
+            auto* rootParam = processor.param (pid::root);
+            processor.getUndoManager().beginNewTransaction();
+            rootParam->beginChangeGesture();
+            rootParam->setValueNotifyingHost (rootParam->convertTo0to1 ((float) note));
+            rootParam->endChangeGesture();
+            focusParam (pid::root);
+        };
 
         // Footer.
         content.addAndMakeVisible (meter);
@@ -465,11 +475,8 @@ namespace thf::grain
             focusedPad = pad;
             focusTime = juce::Time::getMillisecondCounter();
         }
-        processor.pressPad (pad, down, juce::Time::getMillisecondCounterHiRes() * 0.001);
-        if (! down && padBank == 0 && layout::padsBankA[(size_t) index].action == layout::PadAction::abToggle)
-            return;
-        refreshPads();
-        updateStatus();
+        // Handled on the audio thread, exactly like the hardware pad.
+        processor.pressPadFromUi (pad, down, (float) keyboard.getVelocity() / 127.0f);
     }
 
     void GrainEditor::showCueMenu (int index)
@@ -689,6 +696,7 @@ namespace thf::grain
         encoderModes.addItem (4, tr ("Absolute (with pickup)"), true, ! autoMode && mode == midi::EncoderMode::absolute);
         menu.addSubMenu (tr ("Encoders"), encoderModes);
         menu.addItem (10, tr ("Pads control the instrument"), true, processor.getPadsAsControls());
+        menu.addItem (11, tr ("Cue pads play the sample"), true, processor.getCuePadsPlay());
         for (int ch = 1; ch <= 16; ++ch)
             channels.addItem (100 + ch, juce::String (ch), true, processor.getPadChannel() == ch);
         menu.addSubMenu (tr ("Pad MIDI channel"), channels);
@@ -703,6 +711,8 @@ namespace thf::grain
                 processor.setEncoderAutoDetect (true);
             else if (r == 10)
                 processor.setPadsAsControls (! processor.getPadsAsControls());
+            else if (r == 11)
+                processor.setCuePadsPlay (! processor.getCuePadsPlay());
             else if (r > 100)
                 processor.setPadChannel (r - 100);
             else if (r == 20)
@@ -739,12 +749,17 @@ namespace thf::grain
 
     void GrainEditor::filesDropped (const juce::StringArray& files, int, int)
     {
+        // The first file loads; all of them become the set that < > steps through.
         waveform.setDropHighlight (false);
+        juce::Array<juce::File> audio;
         for (auto& f : files)
             if (juce::File (f).hasFileExtension (sources::audioExtensions()))
-            {
-                processor.loadSampleAsync (juce::File (f));
-                return;
-            }
+                audio.add (juce::File (f));
+        if (audio.isEmpty())
+            return;
+        processor.setBrowseList (audio);
+        for (const auto& f : audio)
+            library::addRecent (f);
+        processor.loadSampleAsync (audio.getFirst());
     }
 }

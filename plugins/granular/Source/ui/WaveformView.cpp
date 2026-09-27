@@ -66,16 +66,43 @@ namespace thf::grain
         return getLocalBounds().toFloat().reduced (14.0f, 0.0f).withTrimmedTop (40.0f).withTrimmedBottom (34.0f);
     }
 
+    juce::Rectangle<float> WaveformView::minimapArea() const
+    {
+        // In the footer, between the position readout and the activity readout.
+        const auto footer = getLocalBounds().toFloat().reduced (16.0f, 0.0f).removeFromBottom (30.0f);
+        return footer.reduced (180.0f, 0.0f).withSizeKeepingCentre (footer.getWidth() - 360.0f, 10.0f);
+    }
+
+    // x <-> position (0..1 of the whole sample) through the zoomed view.
     float WaveformView::xToPosition (float x) const
     {
         const auto a = waveArea();
-        return juce::jlimit (0.0f, 1.0f, (x - a.getX()) / a.getWidth());
+        return juce::jlimit (0.0f, 1.0f, (float) (view.start + (double) ((x - a.getX()) / a.getWidth()) * view.span()));
     }
 
     float WaveformView::positionToX (float p) const
     {
         const auto a = waveArea();
-        return a.getX() + p * a.getWidth();
+        return a.getX() + (float) (((double) p - view.start) / view.span()) * a.getWidth();
+    }
+
+    float WaveformView::snapHandle (float position, bool free) const
+    {
+        if (source == nullptr || free)
+            return position;
+        // An attack within 6 px wins; otherwise the nearest zero crossing within 2 ms.
+        const auto length = (float) source->getLength();
+        const auto x = positionToX (position);
+        float best = -1.0f, bestDistance = 6.0f;
+        for (const auto& o : source->getOnsets())
+        {
+            const auto d = std::abs (positionToX ((float) o.position / length) - x);
+            if (d < bestDistance) { bestDistance = d; best = (float) o.position / length; }
+        }
+        if (best >= 0.0f)
+            return best;
+        const auto radius = (int) (0.002 * source->getSampleRate());
+        return (float) source->nearestZeroCrossing ((int) std::lround (position * length), radius) / length;
     }
 
     void WaveformView::tick()
@@ -88,6 +115,7 @@ namespace thf::grain
             sourceSerial = serial;
             sourceChoice = choice;
             source = proc.getCurrentSourceForDisplay();
+            view = {};
             live.clear();
             const auto label = choice == 0 ? (source != nullptr ? tr ("Sample") : tr ("Load sample..."))
                                            : tr (sourceChoices[choice]);
@@ -154,15 +182,15 @@ namespace thf::grain
         if (source != nullptr && source->getDurationSeconds() > 0.0)
         {
             const auto seconds = source->getDurationSeconds();
-            const auto pxPerSecond = area.getWidth() / seconds;
+            const auto pxPerSecond = area.getWidth() / (seconds * view.span());
             double step = 0.001;
             for (double candidate : { 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0 })
                 if ((step = candidate) * pxPerSecond >= 60.0)
                     break;
-            for (double t = step; t < seconds; t += step)
+            for (auto t = std::ceil (view.start * seconds / step) * step; t < view.end * seconds; t += step)
             {
-                const auto x = area.getX() + (float) (t * pxPerSecond);
-                g.drawVerticalLine ((int) x, area.getBottom() - 6.0f, area.getBottom());
+                const auto x = positionToX ((float) (t / seconds));
+                g.drawVerticalLine ((int) x, area.getY(), area.getY() + 6.0f);
             }
         }
 
@@ -180,34 +208,34 @@ namespace thf::grain
             return;
         }
 
-        // Waveform: min/max per pixel column from the overview.
-        const auto& mins = source->getPeakMin();
-        const auto& maxs = source->getPeakMax();
-        const auto buckets = (int) mins.size();
+        // Waveform in its real level (as normalised when Normalize is on), min/max per pixel
+        // column of the zoomed view.
+        g.saveState();
+        g.reduceClipRegion (area.toNearestInt().expanded (0, 24));
         const auto width = juce::jmax (1, (int) area.getWidth());
-        const auto halfH = area.getHeight() * 0.46f;
-        float peak = 1.0e-3f;
-        for (int b = 0; b < buckets; ++b)
-            peak = juce::jmax (peak, maxs[(size_t) b], -mins[(size_t) b]);
-        const auto scale = 1.0f / peak;
-
+        const auto halfH = area.getHeight() * 0.48f;
+        const auto scale = proc.param (pid::normalize)->getValue() > 0.5f ? source->getNormalGain() : 1.0f;
+        columnMin.resize ((size_t) width);
+        columnMax.resize ((size_t) width);
+        source->getPeaks (view.start, view.end, width, columnMin.data(), columnMax.data());
         juce::Path wave;
         for (int x = 0; x < width; ++x)
         {
-            const auto b0 = x * buckets / width;
-            const auto b1 = juce::jmax (b0 + 1, (x + 1) * buckets / width);
-            float lo = 0.0f, hi = 0.0f;
-            for (int b = b0; b < b1 && b < buckets; ++b)
-            {
-                lo = juce::jmin (lo, mins[(size_t) b]);
-                hi = juce::jmax (hi, maxs[(size_t) b]);
-            }
-            const auto px = area.getX() + (float) x;
-            wave.addRectangle (px, area.getCentreY() - hi * scale * halfH, 1.0f,
-                               juce::jmax (1.0f, (hi - lo) * scale * halfH));
+            const auto lo = juce::jlimit (-1.0f, 1.0f, columnMin[(size_t) x] * scale);
+            const auto hi = juce::jlimit (-1.0f, 1.0f, columnMax[(size_t) x] * scale);
+            wave.addRectangle (area.getX() + (float) x, area.getCentreY() - hi * halfH, 1.0f, juce::jmax (1.0f, (hi - lo) * halfH));
         }
         g.setColour (glassText.withAlpha (0.55f));
         g.fillPath (wave);
+
+        // Attacks: short marks along the bottom edge.
+        g.setColour (accentTeal.withAlpha (0.7f));
+        for (const auto& o : source->getOnsets())
+        {
+            const auto x = positionToX ((float) o.position / (float) source->getLength());
+            if (x >= area.getX() && x <= area.getRight())
+                g.drawVerticalLine ((int) x, area.getBottom() - 5.0f, area.getBottom());
+        }
 
         // Region: everything outside is dimmed, the edges are draggable handles.
         const auto xStart = positionToX (regionStart()), xEnd = positionToX (regionEnd());
@@ -272,6 +300,29 @@ namespace thf::grain
             g.drawText (juce::String (i + 1), tag, juce::Justification::centred);
         }
 
+        g.restoreState();
+
+        // Whole-sample strip while zoomed in: the shown part is outlined.
+        if (! view.isWhole())
+        {
+            const auto m = minimapArea();
+            g.setColour (glassRaised);
+            g.fillRoundedRectangle (m, 2.0f);
+            const auto buckets = (int) source->getPeakMax().size();
+            juce::Path strip;
+            for (int x = 0; x < (int) m.getWidth(); ++x)
+            {
+                const auto b = x * buckets / juce::jmax (1, (int) m.getWidth());
+                const auto h = juce::jlimit (0.0f, 1.0f, juce::jmax (source->getPeakMax()[(size_t) b], -source->getPeakMin()[(size_t) b]) * scale);
+                strip.addRectangle (m.getX() + (float) x, m.getCentreY() - h * m.getHeight() * 0.5f, 1.0f, juce::jmax (1.0f, h * m.getHeight()));
+            }
+            g.setColour (glassDim);
+            g.fillPath (strip);
+            g.setColour (glassText);
+            g.drawRect (juce::Rectangle<float> (m.getX() + (float) view.start * m.getWidth(), m.getY() - 1.0f,
+                                                juce::jmax (2.0f, (float) view.span() * m.getWidth()), m.getHeight() + 2.0f), 1.0f);
+        }
+
         // Footer: engine activity.
         auto footer = getLocalBounds().reduced (16, 0).removeFromBottom (30);
         g.setFont (laf.font (12.5f));
@@ -298,6 +349,12 @@ namespace thf::grain
             return;
         }
         auto& proc = ctx.processor;
+        if (! view.isWhole() && minimapArea().expanded (0.0f, 4.0f).contains (e.position))
+        {
+            drag = Drag::minimap;
+            mouseDrag (e);
+            return;
+        }
         proc.getUndoManager().beginNewTransaction();
 
         // Region handles take priority when grabbed within a few pixels.
@@ -328,14 +385,24 @@ namespace thf::grain
     void WaveformView::mouseDrag (const juce::MouseEvent& e)
     {
         auto& proc = ctx.processor;
+        if (drag == Drag::minimap)
+        {
+            const auto m = minimapArea();
+            const auto centre = (double) ((e.position.x - m.getX()) / m.getWidth());
+            view = wave::clampView ({ centre - view.span() * 0.5, centre + view.span() * 0.5 },
+                                    wave::minimumViewSpan (source != nullptr ? source->getLength() : 1));
+            repaint();
+            return;
+        }
         if (drag == Drag::regionStart || drag == Drag::regionEnd)
         {
-            // Handles never cross: at least 0.5 % of the file stays between them.
-            const auto x = xToPosition ((float) e.x);
+            // Handles never cross; they snap to attacks and zero crossings (Alt: free).
+            const auto minGap = source != nullptr ? wave::minimumRegion (source->getDurationSeconds(), source->getSampleRate()) : 0.005;
+            const auto x = snapHandle (xToPosition ((float) e.x), e.mods.isAltDown());
             if (drag == Drag::regionStart)
-                proc.param (pid::regionStart)->setValueNotifyingHost (juce::jmin (x, regionEnd() - 0.005f));
+                proc.param (pid::regionStart)->setValueNotifyingHost ((float) wave::clampHandle (x, regionEnd(), true, minGap));
             else
-                proc.param (pid::regionEnd)->setValueNotifyingHost (juce::jmax (x, regionStart() + 0.005f));
+                proc.param (pid::regionEnd)->setValueNotifyingHost ((float) wave::clampHandle (x, regionStart(), false, minGap));
             return;
         }
         if (! dragging)
@@ -370,10 +437,17 @@ namespace thf::grain
 
     void WaveformView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
     {
-        // Only with a modifier: a trackpad scrolling past must not change the sound.
+        // Without a modifier the wheel zooms (sideways scroll pans): never the sound.
         if (! e.mods.isCommandDown() && ! e.mods.isShiftDown())
         {
-            juce::Component::mouseWheelMove (e, w);
+            if (source == nullptr)
+                return;
+            const auto minSpan = wave::minimumViewSpan (source->getLength());
+            if (std::abs (w.deltaX) > std::abs (w.deltaY))
+                view = wave::pan (view, -w.deltaX * view.span(), minSpan);
+            else
+                view = wave::zoomAround (view, xToPosition ((float) e.x), std::exp (-w.deltaY * 2.0), minSpan);
+            repaint();
             return;
         }
         auto* p = ctx.processor.param (e.mods.isShiftDown() ? pid::spray : pid::size);
@@ -381,6 +455,17 @@ namespace thf::grain
         p->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, p->getValue() + w.deltaY * 0.05f));
         p->endChangeGesture();
         if (ctx.onFocus) ctx.onFocus (p->getParameterID());
+    }
+
+    void WaveformView::mouseDoubleClick (const juce::MouseEvent& e)
+    {
+        // Whole sample; from the whole sample, the region.
+        if (view.isWhole() && (regionStart() > 0.0f || regionEnd() < 1.0f))
+            view = wave::clampView ({ regionStart(), regionEnd() }, wave::minimumViewSpan (source != nullptr ? source->getLength() : 1));
+        else
+            view = {};
+        juce::ignoreUnused (e);
+        repaint();
     }
 
     void WaveformView::showMenu (const juce::MouseEvent& e)
@@ -400,7 +485,7 @@ namespace thf::grain
                             {
                                 if (r == 1 && onLoadRequest) onLoadRequest();
                                 if (r == 2) for (int i = 0; i < 8; ++i) proc.setCue (i, -1.0f);
-                                if (r >= 100) proc.setCue (r - 100, toRelative (where));
+                                if (r >= 100) proc.setCue (r - 100, toRelative (snapHandle (where, false)));
                             });
     }
 
@@ -409,15 +494,8 @@ namespace thf::grain
         auto& proc = ctx.processor;
         if (sourceChoice == 0)
         {
-            // Own samples: the neighbour in the same folder, or the first of "My samples".
-            const auto current = proc.getUserSample();
-            juce::File next;
-            if (current != nullptr && current->file.existsAsFile())
-                next = library::neighbour (current->file, delta);
-            else if (const auto files = library::audioFilesIn (library::userFolder()); ! files.isEmpty())
-                next = delta > 0 ? files.getFirst() : files.getLast();
-            if (next.existsAsFile())
-                proc.loadSampleAsync (next);
+            // Own samples: the next file of a dropped set, or the neighbour in the same folder.
+            proc.stepSample (delta);
             return;
         }
         // Built-in sources cycle among themselves.
@@ -436,7 +514,8 @@ namespace thf::grain
         const auto recentFiles = library::recent();
         const auto myFiles = library::audioFilesIn (library::userFolder());
 
-        juce::PopupMenu menu, recentMenu, myMenu, builtIns;
+        const auto favourites = library::favourites();
+        juce::PopupMenu menu, recentMenu, myMenu, builtIns, favouriteMenu;
         menu.addItem (1, tr ("Load sample..."));
         for (int i = 0; i < recentFiles.size(); ++i)
             recentMenu.addItem (1000 + i, recentFiles[i].getFileName());
@@ -446,6 +525,9 @@ namespace thf::grain
         if (! myFiles.isEmpty()) myMenu.addSeparator();
         myMenu.addItem (3, tr ("Open the folder"));
         menu.addSubMenu (tr ("My samples"), myMenu);
+        for (int i = 0; i < favourites.size(); ++i)
+            favouriteMenu.addItem (4000 + i, favourites[i].getFileName());
+        menu.addSubMenu (tr ("Favourites"), favouriteMenu, ! favourites.isEmpty());
         for (int c = 1; c < sourceChoices.size(); ++c)
             builtIns.addItem (3000 + c, tr (sourceChoices[c]), true, sourceChoice == c);
         menu.addSubMenu (tr ("Built-in sources"), builtIns);
@@ -462,6 +544,10 @@ namespace thf::grain
             }
             menu.addItem (5, tr ("Normalize"), true, proc.param (pid::normalize)->getValue() > 0.5f);
             menu.addItem (6, tr ("Reset region"), regionStart() > 0.0f || regionEnd() < 1.0f);
+            menu.addItem (11, tr ("Cues on the attacks"), ! sample->getOnsets().empty());
+            menu.addItem (12, tr ("Trim to region"), regionStart() > 0.0f || regionEnd() < 1.0f);
+            if (sample->file.existsAsFile())
+                menu.addItem (13, tr ("Favourite"), true, library::isFavourite (sample->file));
             menu.addItem (10, tr ("Keep this sample when switching presets"), true, proc.getKeepSample());
             if (sample->file.existsAsFile())
                 menu.addItem (7, tr ("Show in Finder"));
@@ -469,10 +555,12 @@ namespace thf::grain
         }
         if (proc.getMissingSamplePath().isNotEmpty())
             menu.addItem (9, tr ("Find the missing file..."));
+        if (proc.isPreviewing())
+            menu.addItem (14, tr ("Stop listening"));
 
         juce::Component::SafePointer<WaveformView> safe (this);
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&sampleButton),
-                            [safe, recentFiles, myFiles, sample] (int r)
+                            [safe, recentFiles, myFiles, favourites, sample] (int r)
                             {
                                 if (safe == nullptr || r == 0)
                                     return;
@@ -492,9 +580,28 @@ namespace thf::grain
                                 else if (r == 7 && sample) sample->file.revealToUser();
                                 else if (r == 8)           p.clearUserSample();
                                 else if (r == 10)          p.setKeepSample (! p.getKeepSample());
-                                else if (r >= 3000)        setParam (pid::source, p.param (pid::source)->convertTo0to1 ((float) (r - 3000)));
-                                else if (r >= 2000)        p.loadSampleAsync (myFiles[r - 2000]);
-                                else if (r >= 1000)        p.loadSampleAsync (recentFiles[r - 1000]);
+                                else if (r == 11)          p.sliceCuesFromAttacks();
+                                else if (r == 12)          { juce::String error; p.trimToRegion (error); }
+                                else if (r == 13 && sample) library::setFavourite (sample->file, ! library::isFavourite (sample->file));
+                                else if (r == 14)          p.stopPreview();
+                                else if (r >= 3000 && r < 4000) setParam (pid::source, p.param (pid::source)->convertTo0to1 ((float) (r - 3000)));
+                                else
+                                {
+                                    // A file: Alt listens to it without loading.
+                                    juce::File file;
+                                    if (r >= 4000)      file = favourites[r - 4000];
+                                    else if (r >= 2000) file = myFiles[r - 2000];
+                                    else if (r >= 1000) file = recentFiles[r - 1000];
+                                    if (! file.existsAsFile())
+                                        return;
+                                    if (juce::ModifierKeys::getCurrentModifiersRealtime().isAltDown())
+                                        p.previewFile (file);
+                                    else
+                                    {
+                                        p.stopPreview();
+                                        p.loadSampleAsync (file);
+                                    }
+                                }
                             });
     }
 }

@@ -17,6 +17,7 @@ namespace thf::grain
         bool normalizeSource = true; // play user samples at a standard level
         float scan = 0.0f;          // playhead speed, x realtime of the source
         bool perNoteScan = false;
+        int scanLoop = 0;           // at the region's end: 0 loop, 1 ping-pong, 2 once (stop)
         bool freeze = false;
         float spray = 0.04f;        // 0..1 of the region, centred on the playhead
         float sizeMs = 120.0f;
@@ -98,12 +99,17 @@ namespace thf::grain
         void setSource (const SourceData* s) noexcept { setSource (SourceData::Ptr (const_cast<SourceData*> (s))); }
 
         void noteOn (int note, float velocity, const EngineParams&);
+        // A note that plays from its own position (a cue pad): `id` identifies it for
+        // noteOff, `pitchNote` sets the pitch, `anchor` is the position in the region (0..1).
+        void noteOnAt (int id, int pitchNote, float velocity, float anchor, const EngineParams&);
         void noteOff (int note, const EngineParams&);
         void allNotesOff (bool immediate);
         void setSustainPedal (bool down);
         void setHold (bool on);
         void setPitchBend (float bipolar) noexcept  { bend = bipolar; }
         void setModWheel (float unipolar) noexcept  { modWheel = unipolar; }
+        // Aftertouch / pad pressure: modulates like the mod strip (whichever is higher).
+        void setPressure (float unipolar) noexcept  { pressure = unipolar; }
         void resetScan() noexcept;
         // 5 ms fade of the whole output (bulk parameter changes). isFadedOut() is true once
         // the output has reached silence; any thread may read it. The output comes back by
@@ -118,6 +124,9 @@ namespace thf::grain
 
         // Nearest allowed interval for a random pitch offset (semitones).
         static float quantizeInterval (float semitones, int mode) noexcept;
+
+        // Position + scan to a playhead in the region (0..1) for a Scan Loop mode.
+        static double mapPlayhead (double position, int scanLoop) noexcept;
 
         // Renders and ADDS nothing: overwrites left/right with n samples.
         void render (float* left, float* right, int n, const EngineParams&);
@@ -164,6 +173,7 @@ namespace thf::grain
             double holdoff = 0;     // samples during which Sync ticks are skipped (note-on grain)
             double scanOffset = 0;
             float currentNote = 60, targetNote = 60;
+            float anchor = -1;      // own position (cue pads), -1 = follow Position
             int grains = 0;
             float cutoffSmoothed = 1000;
             bool firstBlock = true;
@@ -172,8 +182,8 @@ namespace thf::grain
             float energy = 0, energySmoothed = 0, powerSmoothed = 0, coherence = 1;
 
             // Voice stealing: the new note waits for the fade of the old one.
-            int pendingNote = -1;
-            float pendingVelocityGain = 1;
+            int pendingNote = -1, pendingPitch = -1;
+            float pendingVelocityGain = 1, pendingAnchor = -1;
             bool pendingKeyDown = false;
         };
 
@@ -183,6 +193,11 @@ namespace thf::grain
         };
 
         void startVoice (Voice&, int note, float velocityGain, bool keyDown, const EngineParams&);
+        static double advanceScan (double scan, double step, int scanLoop) noexcept;
+        // Pitch and position of the note being started (noteOnAt), -1 = the note itself / Position.
+        int nextPitch = -1;
+        float nextAnchor = -1.0f;
+        float pitchFor (int note) const noexcept { return nextPitch >= 0 ? (float) nextPitch : (float) note; }
         int allocateVoice (const EngineParams&);
         void releaseVoice (Voice&);
         float stealSamples (int note) const noexcept;
@@ -242,7 +257,7 @@ namespace thf::grain
 
         double globalScan = 0.0;
         bool sustainPedal = false, holdOn = false;
-        float bend = 0.0f, modWheel = 0.0f;
+        float bend = 0.0f, modWheel = 0.0f, pressure = 0.0f;
         float lfoValue = 0.0f;
         Modulation modulation;
         float driveSmoothed = 0.0f, gainSmoothed = 1.0f, resonanceSmoothed = 0.1f;

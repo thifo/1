@@ -367,6 +367,16 @@ namespace thf::grain
         return MidiKeyboardComponent::keyPressed (key);
     }
 
+    bool PlayKeyboard::mouseDownOnKey (int note, const juce::MouseEvent& e)
+    {
+        if (e.mods.isAltDown() && onRootPick)
+        {
+            onRootPick (note);
+            return false;       // picks, does not play
+        }
+        return true;
+    }
+
     void PlayKeyboard::drawWhiteNote (int note, juce::Graphics& g, juce::Rectangle<float> area, bool isDown,
                                       bool isOver, juce::Colour, juce::Colour)
     {
@@ -487,6 +497,7 @@ namespace thf::grain
         groups.resize (5);
         groups[0].title = "Source";
         addChoice (groups[0], pid::source);
+        addChoice (groups[0], pid::scanLoop);
         addChoice (groups[0], pid::syncRate);
         addKnob (groups[0], pid::window);
 
@@ -627,7 +638,7 @@ namespace thf::grain
 
         // Written with "|" for the separator dot; UTF-8 stays out of C++ literals.
         const std::pair<const char*, const char*> lines[] = {
-            { "Keyboard", "play grains; pitch is relative to Root" },
+            { "Keyboard", "play grains; pitch is relative to Root | Alt-click a key: Root" },
             { "Main encoder", "turn: Position | click: next page | hold + turn: next sample" },
             { "Encoders 1-8", "parameters of the current page" },
             { "Faders 1-4", "envelope; they pick up the current value (hollow cap: hardware position)" },
@@ -635,7 +646,8 @@ namespace thf::grain
             { "Pads: Cues", "tap an empty pad to store, tap to jump, hold to overwrite | pad + encoder click: delete" },
             { "Touch strips", "pitch bend | modulation (target in More settings)" },
             { "Computer keyboard", "A-K play | Z X octave | C V velocity" },
-            { "Waveform", "drag sideways: Position | up/down or Alt-drag: Spray | Cmd-wheel: Size | Shift-wheel: Spray" },
+            { "Waveform", "drag sideways: Position | up/down or Alt-drag: Spray | wheel: zoom | double-click: whole sample | Cmd-wheel: Size" },
+            { "Sample menu", "Alt-click a file: listen without loading | handles snap to attacks (Alt: free)" },
             { "Cmd+Z / Shift+Cmd+Z", "undo / redo" },
             { "Right-click a control", "MIDI Learn, forget CC, reset" },
             { "Double-click a control", "default value" },
