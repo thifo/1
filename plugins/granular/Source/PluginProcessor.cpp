@@ -198,6 +198,10 @@ namespace thf::grain
         if (scanResetRequested.exchange (false))
             engine.resetScan();
 
+        // Adds notes played on the on-screen / computer keyboard and records incoming ones
+        // so the keyboard lights up.
+        keyboardState.processNextMidiBuffer (midiMessages, 0, numSamples, true);
+
         auto* left = buffer.getWritePointer (0);
         auto* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
         float scratch[GrainEngine::controlBlock];

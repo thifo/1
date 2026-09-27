@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../PluginProcessor.h"
+#include <juce_audio_utils/juce_audio_utils.h>
 #include <ui/ThifoLookAndFeel.h>
 #include <ui/Palette.h>
 
@@ -140,6 +141,36 @@ namespace thf::grain
     private:
         bool pitch;
         float value;
+    };
+
+    //==============================================================================
+    // The controller's 25 keys on screen, also playable from the computer keyboard like in
+    // Ableton: A-K white keys, W E T Y U black keys, Z/X octave, C/V velocity.
+    class PlayKeyboard : public juce::MidiKeyboardComponent
+    {
+    public:
+        static constexpr int numKeys = 25;
+        static constexpr int midiChannel = 16;   // keeps these notes apart from the controller's
+
+        explicit PlayKeyboard (juce::MidiKeyboardState&);
+
+        int getLowestNote() const noexcept     { return lowest; }
+        int getVelocity() const noexcept       { return velocity; }
+        void shiftOctave (int delta);
+        void changeVelocity (int delta);
+        void setPadChannel (int channel);
+        std::function<void()> onSettingsChanged;
+
+        bool keyPressed (const juce::KeyPress&) override;
+        void drawWhiteNote (int note, juce::Graphics&, juce::Rectangle<float>, bool isDown, bool isOver,
+                            juce::Colour lineColour, juce::Colour textColour) override;
+        void drawBlackNote (int note, juce::Graphics&, juce::Rectangle<float>, bool isDown, bool isOver,
+                            juce::Colour noteFillColour) override;
+
+    private:
+        void applyRange();
+        int lowest = 48;       // C2..C4, as the controller starts
+        int velocity = 100;
     };
 
     //==============================================================================

@@ -486,6 +486,22 @@ public:
             expectWithinAbsoluteError (p.param (pid::position)->getValue(), 0.3f, 1.0e-3f);
         }
 
+        beginTest ("On-screen / computer keyboard notes reach the engine");
+        {
+            GrainProcessor p;
+            waitForFactory (p);
+            p.prepareToPlay (rate, 512);
+            juce::MidiBuffer midi;
+            p.getKeyboardState().noteOn (16, 60, 0.8f);
+            process (p, midi);
+            process (p, midi);
+            expectEquals (p.getEngine().getActiveVoices(), 1);
+            p.getKeyboardState().noteOff (16, 60, 0.0f);
+            p.param (pid::release)->setValueNotifyingHost (0.0f);
+            for (int i = 0; i < 20; ++i) process (p, midi);
+            expectEquals (p.getEngine().getActiveVoices(), 0);
+        }
+
         beginTest ("MIDI learn assigns a CC and takes priority over the template");
         {
             GrainProcessor p;

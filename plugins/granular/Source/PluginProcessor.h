@@ -63,6 +63,8 @@ namespace thf::grain
         juce::UndoManager& getUndoManager() noexcept           { return undoManager; }
         PresetManager& getPresets() noexcept                   { return presets; }
         GrainEngine& getEngine() noexcept                      { return engine; }
+        // Notes from the on-screen / computer keyboard (and a mirror of incoming notes).
+        juce::MidiKeyboardState& getKeyboardState() noexcept   { return keyboardState; }
 
         // Sample handling (message thread).
         void loadSampleAsync (const juce::File&);
@@ -157,6 +159,7 @@ namespace thf::grain
         PresetManager presets { *this };
 
         juce::SharedResourcePointer<FactorySources> factory;
+        juce::MidiKeyboardState keyboardState;
         GrainEngine engine;
 
         // Parameter pointers cached for the audio thread (no string lookups there).

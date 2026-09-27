@@ -121,6 +121,12 @@ public:
                 if (pad > 0) expect (b.getX() > editor.getPadBounds (pad - 1).getX());
             }
             expect (editor.getPadBounds (0).getX() <= main.getX());
+
+            // Keys: below the pads, across the width, like on the controller.
+            const auto keys = editor.getKeyboardBounds();
+            expect (keys.getY() >= editor.getPadBounds (0).getBottom());
+            expect (keys.getX() <= editor.getPadBounds (0).getX());
+            expect (keys.getRight() >= editor.getPadBounds (layout::numPads - 1).getRight());
             expect (editor.getPadBounds (layout::numPads - 1).getRight() >= editor.getFaderBounds (layout::numFaders - 1).getX());
             pump();
         }

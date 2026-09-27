@@ -276,6 +276,90 @@ namespace thf::grain
     }
 
     //==============================================================================
+    PlayKeyboard::PlayKeyboard (juce::MidiKeyboardState& s)
+        : juce::MidiKeyboardComponent (s, juce::KeyboardComponentBase::horizontalKeyboard)
+    {
+        setMidiChannel (midiChannel);
+        setScrollButtonsVisible (false);
+        setOctaveForMiddleC (3);             // 60 = C3, as in Ableton
+        setBlackNoteLengthProportion (0.6f);
+        setWantsKeyboardFocus (true);
+        setColour (keyDownOverlayColourId, accentBlue.withAlpha (0.75f));
+        setColour (mouseOverKeyOverlayColourId, accentBlue.withAlpha (0.15f));
+        setPadChannel (layout::minilab3::padChannel);
+        applyRange();
+    }
+
+    void PlayKeyboard::applyRange()
+    {
+        setAvailableRange (lowest, lowest + numKeys - 1);
+        setKeyPressBaseOctave (lowest / 12 + 1);   // "A" plays the C in the middle of the range
+        setVelocity ((float) velocity / 127.0f, false);
+    }
+
+    void PlayKeyboard::setPadChannel (int channel)
+    {
+        // Show every channel except the one the pads use (their notes are controls).
+        setMidiChannelsToDisplay (0xffff & ~(1 << (channel - 1)));
+    }
+
+    void PlayKeyboard::shiftOctave (int delta)
+    {
+        const auto next = juce::jlimit (0, 120 - numKeys, lowest + 12 * delta);
+        if (next == lowest)
+            return;
+        focusLost (focusChangedDirectly);   // releases held keys before the mapping moves
+        lowest = next;
+        applyRange();
+        repaint();
+        if (onSettingsChanged) onSettingsChanged();
+    }
+
+    void PlayKeyboard::changeVelocity (int delta)
+    {
+        velocity = juce::jlimit (1, 127, velocity + delta);
+        applyRange();
+        if (onSettingsChanged) onSettingsChanged();
+    }
+
+    bool PlayKeyboard::keyPressed (const juce::KeyPress& key)
+    {
+        switch (juce::CharacterFunctions::toLowerCase (key.getTextCharacter()))
+        {
+            case 'z': shiftOctave (-1); return true;
+            case 'x': shiftOctave (1); return true;
+            case 'c': changeVelocity (-20); return true;
+            case 'v': changeVelocity (20); return true;
+            default: break;
+        }
+        return MidiKeyboardComponent::keyPressed (key);
+    }
+
+    void PlayKeyboard::drawWhiteNote (int note, juce::Graphics& g, juce::Rectangle<float> area, bool isDown,
+                                      bool isOver, juce::Colour, juce::Colour)
+    {
+        auto key = area.reduced (1.0f, 0.0f).withTrimmedBottom (1.0f);
+        g.setColour (isDown ? padLit (padBlue) : (isOver ? plateRaised.darker (0.03f) : juce::Colours::white));
+        g.fillRoundedRectangle (key, 3.0f);
+        g.setColour (plateEdge);
+        g.drawRoundedRectangle (key, 3.0f, 1.0f);
+        if (note % 12 == 0)
+        {
+            g.setColour (inkFaint);
+            g.setFont (juce::FontOptions (11.0f));
+            g.drawText (noteName (note), key.removeFromBottom (18.0f), juce::Justification::centred);
+        }
+    }
+
+    void PlayKeyboard::drawBlackNote (int, juce::Graphics& g, juce::Rectangle<float> area, bool isDown,
+                                      bool isOver, juce::Colour)
+    {
+        auto key = area.reduced (1.5f, 0.0f);
+        g.setColour (isDown ? accentBlue : (isOver ? ink.brighter (0.3f) : ink));
+        g.fillRoundedRectangle (key, 2.5f);
+    }
+
+    //==============================================================================
     void MeterView::push (float l, float r)
     {
         auto toPos = [] (float v) { return juce::jlimit (0.0f, 1.0f, (juce::Decibels::gainToDecibels (v, -60.0f) + 60.0f) / 60.0f); };
@@ -452,6 +536,7 @@ namespace thf::grain
             { "Pads, bank A", "Freeze | Hold | Reverse | Window | Sync | Filter | Mode | A/B" },
             { "Pads, bank B", "cues: tap an empty pad to store, tap to jump, hold to overwrite" },
             { "Touch strips", "pitch bend | modulation (target in More settings)" },
+            { "Computer keyboard", "A-K play | Z X octave | C V velocity" },
             { "Waveform", "drag: Position | Alt-drag or vertical drag: Spray | wheel: Size" },
             { "Right-click a control", "MIDI Learn, forget CC, reset" },
             { "Double-click a control", "default value" },
@@ -464,7 +549,7 @@ namespace thf::grain
         area.removeFromTop (2);
         for (auto& [what, how] : lines)
         {
-            auto row = area.removeFromTop (23);
+            auto row = area.removeFromTop (21);
             g.setColour (glassText);
             g.setFont (lookAndFeel.font (13.5f, true));
             g.drawText (tr (what), row.removeFromLeft (220), juce::Justification::centredLeft);

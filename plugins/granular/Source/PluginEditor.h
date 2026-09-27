@@ -16,7 +16,7 @@ namespace thf::grain
     {
     public:
         static constexpr int designWidth = 1040;
-        static constexpr int designHeight = 790;
+        static constexpr int designHeight = 872;
 
         explicit GrainEditor (GrainProcessor&);
         ~GrainEditor() override;
@@ -35,6 +35,8 @@ namespace thf::grain
         juce::Rectangle<int> getFaderBounds (int slot) const { return faders[(size_t) slot]->getBounds(); }
         juce::Rectangle<int> getPadBounds (int slot) const { return pads[(size_t) slot]->getBounds(); }
         juce::Rectangle<int> getMainKnobBounds() const { return mainKnob.getBounds(); }
+        juce::Rectangle<int> getKeyboardBounds() const { return keyboard.getBounds(); }
+        PlayKeyboard& getKeyboard() noexcept { return keyboard; }
         void showSettings (bool);
         void showHelp (bool);
         void setPadBank (int bank);
@@ -60,6 +62,7 @@ namespace thf::grain
         void showMidiMenu();
         void chooseSample();
         void padClicked (int index, const juce::ModifierKeys&);
+        void keepKeyboardFocus();
 
         GrainProcessor& processor;
         ThifoLookAndFeel lookAndFeel;
@@ -79,6 +82,7 @@ namespace thf::grain
         std::array<std::unique_ptr<ControlFader>, layout::numFaders> faders;
         std::array<std::unique_ptr<PadButton>, layout::numPads> pads;
         juce::TextButton bankA { "A" }, bankB { "B" };
+        PlayKeyboard keyboard;
         MeterView meter;
         juce::TextButton hqButton { "HQ" }, clipButton, midiButton { "MIDI" };
         std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> hqAttachment, clipAttachment;

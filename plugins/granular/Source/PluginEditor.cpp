@@ -18,7 +18,8 @@ namespace thf::grain
         const juce::Rectangle<int> fadersArea    { 722, 404, 300, 236 };
         const juce::Rectangle<int> padsArea      { 94, 648, 928, 62 };
         const juce::Rectangle<int> bankArea      { 22, 648, 60, 62 };
-        const juce::Rectangle<int> footerArea    { 16, 726, 1008, 56 };
+        const juce::Rectangle<int> keysArea      { 22, 722, 1000, 84 };   // the controller's 25 keys
+        const juce::Rectangle<int> footerArea    { 16, 810, 1008, 56 };
 
         const juce::Colour padColours[] = { padBlue, padTeal, padGreen, padYellow, padSalmon, padGrey, padPink, padCream };
         const juce::Colour faderColours[] = { accentTeal, accentGreen, accentYellow, accentOrange };
@@ -47,6 +48,7 @@ namespace thf::grain
           waveform (ctx),
           screen (lookAndFeel),
           mainKnob (ctx),
+          keyboard (p.getKeyboardState()),
           settings (ctx),
           help (lookAndFeel)
     {
@@ -137,6 +139,10 @@ namespace thf::grain
         bankA.onClick = [this] { setPadBank (0); };
         bankB.onClick = [this] { setPadBank (1); };
 
+        // Keys: on screen, and from the computer keyboard.
+        content.addAndMakeVisible (keyboard);
+        keyboard.onSettingsChanged = [this] { content.repaint (footerArea); };
+
         // Footer.
         content.addAndMakeVisible (meter);
         hqButton.setClickingTogglesState (true);
@@ -159,8 +165,33 @@ namespace thf::grain
         if (auto* c = getConstrainer())
             c->setFixedAspectRatio ((double) designWidth / designHeight);
         setResizeLimits (designWidth * 6 / 10, designHeight * 6 / 10, designWidth * 16 / 10, designHeight * 16 / 10);
-        setSize (designWidth, designHeight);
+        // Start at full size if it fits the screen, otherwise scaled down (laptops).
+        auto scale = 1.0;
+        if (const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
+            scale = juce::jlimit (0.6, 1.0, (display->userBounds.getHeight() - 90) / (double) designHeight);
+        setSize (juce::roundToInt (designWidth * scale), juce::roundToInt (designHeight * scale));
+        keepKeyboardFocus();
         startTimerHz (30);
+    }
+
+    // Only the keyboard takes keyboard focus, so clicking knobs, pads or buttons never stops
+    // the computer keys from playing. Text fields (preset name) still get focus when open.
+    void GrainEditor::keepKeyboardFocus()
+    {
+        std::function<void (juce::Component&)> noFocus = [&noFocus, this] (juce::Component& c)
+        {
+            for (auto* child : c.getChildren())
+            {
+                if (child != &keyboard)
+                {
+                    child->setWantsKeyboardFocus (false);
+                    child->setMouseClickGrabsKeyboardFocus (false);
+                }
+                noFocus (*child);
+            }
+        };
+        noFocus (content);
+        setWantsKeyboardFocus (false);
     }
 
     GrainEditor::~GrainEditor()
@@ -232,6 +263,9 @@ namespace thf::grain
         for (int i = 0; i < layout::numPads; ++i)
             pads[(size_t) i]->setBounds (padsArea.getX() + i * (padW + gap), padsArea.getY(), padW, padsArea.getHeight());
 
+        keyboard.setBounds (keysArea);
+        keyboard.setKeyWidth ((float) keysArea.getWidth() / 15.0f);   // 15 white keys in 25
+
         auto bank = bankArea;
         bankA.setBounds (bank.removeFromTop (29));
         bank.removeFromTop (4);
@@ -275,6 +309,12 @@ namespace thf::grain
         // Output readout next to the meter.
         g.setColour (inkDim);
         g.drawText (tr ("Output"), footerArea.getX() + 6, meter.getY() - 2, 70, 18, juce::Justification::centredLeft);
+
+        // Computer keyboard state: range and velocity.
+        const auto lowest = keyboard.getLowestNote();
+        g.drawText (tr ("Keyboard") + " " + noteName (lowest) + "-" + noteName (lowest + PlayKeyboard::numKeys - 1)
+                        + sep() + tr ("velocity") + " " + juce::String (keyboard.getVelocity()),
+                    meter.getRight() + 24, meter.getY() - 2, 300, 18, juce::Justification::centredLeft);
 
         // Main encoder is endless on the controller: draw the cap only, with a position tick ring.
         const auto knob = mainKnob.getBounds().toFloat();
@@ -454,6 +494,13 @@ namespace thf::grain
         }
         updateStatus();
         refreshPads();
+        keyboard.setPadChannel (processor.getPadsAsControls() ? processor.getPadChannel() : 17);
+
+        // Keep the computer keys playing unless a text field is being edited.
+        if (isShowing() && ! keyboard.hasKeyboardFocus (false)
+            && dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) == nullptr
+            && juce::Component::getCurrentlyModalComponent() == nullptr)
+            keyboard.grabKeyboardFocus();
 
         pitchStrip.setValue (processor.getPitchStrip());
         modStrip.setValue (processor.getModStrip());
