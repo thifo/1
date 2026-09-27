@@ -94,6 +94,7 @@ namespace thf::grain
         layout.add (floatParam (pid::density, "Density", logRange (0.5f, 200.0f, 20.0f), 24.0f, formatHz));
         layout.add (boolParam (pid::sync, "Sync", false));
         layout.add (choiceParam (pid::syncRate, "Sync Rate", syncRateChoices, 3, reservedRates));
+        layout.add (boolParam (pid::linkVoices, "Link Voices", false));
         layout.add (percentParam (pid::chaos, "Chaos", 0.3f));
         layout.add (percentParam (pid::window, "Window", 0.0f));
         layout.add (floatParam (pid::pitch, "Pitch", Range (-24.0f, 24.0f, 1.0f), 0.0f,

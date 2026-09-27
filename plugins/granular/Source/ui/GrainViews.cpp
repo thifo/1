@@ -466,17 +466,26 @@ namespace thf::grain
         }
 
         const char* choiceIds[] = { pid::source, pid::quantize, pid::scanMode, pid::syncRate, pid::voiceMode, pid::filterType,
-                                    pid::lfoShape, pid::lfoTarget, pid::lfoMode, pid::lfoDivision, pid::modTarget };
+                                    pid::lfoShape, pid::lfoTarget, pid::lfoMode, pid::lfoDivision, pid::modTarget,
+                                    pid::linkVoices };
         for (auto* id : choiceIds)
         {
             auto ch = std::make_unique<Choice>();
             ch->paramId = id;
-            auto* p = dynamic_cast<juce::AudioParameterChoice*> (ctx.processor.param (id));
-            for (int i = 0; i < p->choices.size(); ++i)          // real entries only
-                if (p->choices[i] != reservedChoiceName)
-                    ch->box.addItem (p->choices[i], i + 1);
+            auto* param = ctx.processor.param (id);
+            if (auto* p = dynamic_cast<juce::AudioParameterChoice*> (param))
+            {
+                for (int i = 0; i < p->choices.size(); ++i)      // real entries only
+                    if (p->choices[i] != reservedChoiceName)
+                        ch->box.addItem (p->choices[i], i + 1);
+            }
+            else
+            {
+                ch->box.addItem (tr ("Off"), 1);
+                ch->box.addItem (tr ("On"), 2);
+            }
             ch->attachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (ctx.processor.getState(), id, ch->box);
-            ch->label.setText (p->getName (32), juce::dontSendNotification);
+            ch->label.setText (param->getName (32), juce::dontSendNotification);
             styleLabel (ch->label, ctx.lookAndFeel, 12.5f, true, glassText);
             ch->label.setJustificationType (juce::Justification::centredLeft);
             addAndMakeVisible (ch->label);

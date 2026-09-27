@@ -28,7 +28,10 @@ namespace thf::grain
     {
         sampleRate = sr > 0.0 ? sr : 48000.0;
         switchFadeSamples = juce::jmax (16, (int) (0.008 * sampleRate));
+        controlLength = juce::jlimit (16, maxControlBlock, (int) std::lround (32.0 * sampleRate / 48000.0));
+        typeFadeLength = juce::jmax (16, (int) (0.005 * sampleRate));
         reverb.setSampleRate (sampleRate);
+        drive.prepare (sampleRate);
         reset();
     }
 
@@ -73,6 +76,15 @@ namespace thf::grain
         heldPrevious = nullptr;
         drive.reset();
         reverb.reset();
+        shape = {};
+        beatClock = 0.0;
+        hostPlaying = false;
+        linkPhase = 0.0;
+        linkDelayed = -1.0;
+        linkSeed = rng.next() | 1u;
+        sampleClock = 0;
+        filterTypeNow = -1;
+        typeFadeLeft = 0;
         reverbTail = 0;
         levelSmoothed = 1.0f;
         globalScan = 0.0;
@@ -115,6 +127,55 @@ namespace thf::grain
             v.scanOffset = 0.0;
     }
 
+    void GrainEngine::setTransport (bool playing, double ppqPosition) noexcept
+    {
+        hostPlaying = playing;
+        if (playing)
+            beatClock = ppqPosition;
+    }
+
+    float GrainEngine::stealSamples (int note) const noexcept
+    {
+        // Long enough not to tick, longer for low notes whose cycles are long.
+        return (float) ((note < 48 ? 0.008 : 0.004) * sampleRate);
+    }
+
+    GrainEngine::GrainDraw GrainEngine::draw (dsp::Random& r) noexcept
+    {
+        GrainDraw d;
+        d.jitter = r.bipolar();
+        d.spray = r.uniform() - 0.5f;
+        d.reverse = r.uniform();
+        d.pan = r.bipolar();
+        return d;
+    }
+
+    GrainEngine::GrainShape GrainEngine::computeShape (const EngineParams& p) const
+    {
+        const auto sr = (float) sampleRate;
+        GrainShape g;
+        auto density = p.sync ? p.bpm / 60.0 / juce::jmax (1.0e-3, p.syncBeats)
+                              : (double) p.density * modulation.densityMul;
+        density = juce::jlimit (0.1, 1000.0, density);
+        g.interval = sampleRate / density;
+        g.sizeSamples = juce::jlimit (0.002f * sr, 4.0f * sr, p.sizeMs * modulation.sizeMul * 0.001f * sr);
+        g.fade = dsp::windowFade (p.window, g.sizeSamples, sr);
+        const auto overlap = juce::jmin ((double) maxGrainsPerVoice, (double) g.sizeSamples / g.interval);
+
+        // Regular onsets: a Tukey window sums to a constant when its fall lines up with the
+        // rise of the k-th next grain, fade = 1 - k / overlap. Flat windows are widened to
+        // that fade (never narrowed), fully at chaos 0 and fading out by chaos 0.25.
+        if (overlap >= 1.0 && p.chaos < 0.25f)
+        {
+            const auto k = std::ceil (overlap * 0.5);
+            const auto constantSum = (float) (1.0 - k / overlap);
+            const auto weight = 1.0f - p.chaos / 0.25f;
+            g.fade += weight * (juce::jmax (g.fade, constantSum) - g.fade);
+        }
+        g.normGain = 1.0f / std::sqrt (juce::jmax (1.0f, (float) overlap * dsp::windowEnergy (g.fade)));
+        return g;
+    }
+
     float GrainEngine::velocityGain (float velocity, const EngineParams& p) const
     {
         const auto v = juce::jlimit (0.0f, 1.0f, velocity);
@@ -129,7 +190,11 @@ namespace thf::grain
         for (auto& other : voices)
             anyActive = anyActive || (other.active && &other != &v);
         if (! anyActive)
+        {
             globalScan = 0.0;     // a new phrase starts at Position
+            if (! hostPlaying)
+                beatClock = 0.0;  // ... and, without a running transport, on the beat
+        }
 
         killGrains (index);
         const auto previousNote = v.currentNote;
@@ -147,12 +212,31 @@ namespace thf::grain
         v.filterEnv.trigger();
         v.filter[0].reset();
         v.filter[1].reset();
-        v.countdown = 0.0;
         v.scanOffset = 0.0;
         v.targetNote = (float) note;
         v.currentNote = glideFromPrevious ? previousNote : (float) note;
         v.firstBlock = true;
         v.pendingNote = -1;
+        v.energy = v.energySmoothed = v.powerSmoothed = 0.0f;
+        v.coherence = 1.0f;
+        v.delayed = -1.0;
+
+        // The cloud is there from the first sample: one grain now, plus the grains a running
+        // cloud would already be playing (ages spaced by the onset interval). Linked voices
+        // started together draw the same choices.
+        shape = computeShape (p);
+        dsp::Random linked (linkSeed);
+        auto& r = p.linkVoices ? linked : rng;
+        spawnGrain (index, 0, p, shape, draw (r));
+        const auto gap = [&r, &p] { return (double) ((1.0f - p.chaos) + p.chaos * r.exponential()); };
+        for (double age = shape.interval * gap(); age < (double) shape.sizeSamples; age += shape.interval * gap())
+            if (auto* g = spawnGrain (index, 0, p, shape, draw (r)))
+            {
+                g->age = (int) age;
+                g->readPos += g->step * (double) g->age;
+            }
+        v.phase = gap();
+        v.holdoff = 0.25 * shape.interval;
 
         if (! keyDown)
             releaseVoice (v);
@@ -215,7 +299,7 @@ namespace thf::grain
 
             auto& v = voices[0];
             for (size_t i = 1; i < voices.size(); ++i)
-                if (voices[i].active) voices[i].amp.steal();
+                if (voices[i].active) voices[i].amp.steal (stealSamples (voices[i].note));
 
             if (v.active && ! v.amp.isReleasing() && p.voiceMode == 2)
             {
@@ -253,7 +337,7 @@ namespace thf::grain
         auto& v = voices[(size_t) index];
         if (v.active)
         {
-            v.amp.steal();
+            v.amp.steal (stealSamples (v.note));
             v.pendingNote = note;
             v.pendingVelocityGain = gain;
             v.pendingKeyDown = true;
@@ -379,12 +463,12 @@ namespace thf::grain
     }
 
     //==============================================================================
-    void GrainEngine::spawnGrain (int voiceIndex, int offset, const EngineParams& p, float sizeSamples,
-                                  float fade, float normGain)
+    GrainEngine::Grain* GrainEngine::spawnGrain (int voiceIndex, int offset, const EngineParams& p,
+                                                 const GrainShape& gs, const GrainDraw& d)
     {
         auto& v = voices[(size_t) voiceIndex];
         if (source == nullptr || v.grains >= maxGrainsPerVoice)
-            return;
+            return nullptr;
 
         Grain* g = nullptr;
         for (int k = 0; k < maxGrains && g == nullptr; ++k)
@@ -393,17 +477,13 @@ namespace thf::grain
             if (! candidate.active) { g = &candidate; nextGrain = (nextGrain + k + 1) % maxGrains; }
         }
         if (g == nullptr)
-            return;
+            return nullptr;
 
-        // Random draws happen in a fixed order so renders are reproducible.
-        const auto rJitter = rng.bipolar();
-        const auto rSpray = rng.uniform() - 0.5f;
-        const auto rReverse = rng.uniform();
-        const auto rPan = rng.bipolar();
-
+        auto sizeSamples = gs.sizeSamples;
+        auto fade = gs.fade;
         const auto length0 = (double) source->getLength();
         const auto semis = (v.currentNote - (float) p.root) + p.pitch + bend * p.bendRange
-                         + modulation.pitch + quantizeInterval (p.jitter * rJitter, p.quantize);
+                         + modulation.pitch + quantizeInterval (p.jitter * d.jitter, p.quantize);
         const auto ratio = juce::jlimit (1.0 / 64.0, 32.0,
                                          std::exp2 ((double) semis / 12.0) * source->getSampleRate() / sampleRate);
         auto span0 = (double) sizeSamples * ratio;
@@ -415,7 +495,7 @@ namespace thf::grain
         const auto spray = juce::jlimit (0.0f, 1.0f, p.spray + modulation.spray);
         // The playhead wraps around the region; the spray around it reflects at the edges so
         // no grains pile up on the boundary.
-        auto relative = (double) wrap01 ((double) p.position + modulation.position + scanOffset) + rSpray * spray;
+        auto relative = (double) wrap01 ((double) p.position + modulation.position + scanOffset) + d.spray * spray;
         if (relative < 0.0) relative = -relative;
         if (relative > 1.0) relative = 2.0 - relative;
         relative = juce::jlimit (0.0, 1.0, relative);
@@ -432,15 +512,13 @@ namespace thf::grain
         }
         // Grain starts are spread over the usable part of the region, [lo, hi - span].
         const auto start0 = juce::jlimit (0.0, juce::jmax (0.0, length0 - span0), lo + relative * juce::jmax (0.0, hi - lo - span0));
-        const bool reversed = rReverse < p.reverse;
+        const bool reversed = d.reverse < p.reverse;
 
-        // Octave copy: HQ reads the copy just below the ratio and band-limits the rest with a
-        // stretched sinc; normal mode reads the nearest copy with Hermite interpolation.
-        int level = 0;
-        if (ratio > 1.0)
-            level = (int) std::floor (std::log2 (ratio) + (p.hq ? 0.0 : 0.5));
-        level = juce::jlimit (0, source->getNumLevels() - 1, level);
-        const auto scale = std::ldexp (1.0, -level);
+        // Copy: the one with the most content that still reads at most 2 stored samples per
+        // output sample (see SourceData).
+        const auto level = juce::jlimit (0, source->getNumLevels() - 1,
+                                         ratio <= 1.0 ? 0 : (int) std::ceil (2.0 * std::log2 (ratio) - 1.0e-9));
+        const auto scale = SourceData::levelScale (level);
         const auto effective = ratio * scale;
 
         g->active = true;
@@ -450,24 +528,26 @@ namespace thf::grain
         g->level = level;
         g->step = reversed ? -effective : effective;
         g->readPos = (reversed ? start0 + span0 - ratio : start0) * scale;
-        g->stretch = p.hq ? (float) juce::jlimit (1.0, 2.0, effective) : 1.0f;
         g->age = 0;
         g->length = juce::jmax (1, (int) sizeSamples);
         g->invLength = 1.0f / (float) g->length;
         g->fade = fade;
+        g->invFade = 1.0f / juce::jmax (1.0e-6f, fade);
         g->startOffset = offset;
 
+        auto normGain = gs.normGain;
         if (p.normalizeSource)
             normGain *= source->getNormalGain();
 
-        const auto pan = p.stereo * rPan;
+        const auto pan = p.stereo * d.pan;
         const auto angle = (pan + 1.0f) * dsp::pi * 0.25f;
         g->gainL = std::cos (angle) * 1.41421356f * normGain;
         g->gainR = std::sin (angle) * 1.41421356f * normGain;
         ++v.grains;
 
         pushEvent ({ (float) (start0 / length0), (float) (span0 / length0), pan,
-                     sizeSamples / (float) sampleRate, voiceIndex, reversed });
+                     sizeSamples / (float) sampleRate, voiceIndex, reversed, sampleClock + offset });
+        return g;
     }
 
     void GrainEngine::processControl (const EngineParams& p, int n)
@@ -505,7 +585,6 @@ namespace thf::grain
         const auto smooth5ms = 1.0f - std::exp (-(float) n / (0.005f * sr));
         if (resonanceSmoothed < 0.0f) resonanceSmoothed = p.resonance;
         resonanceSmoothed += (p.resonance - resonanceSmoothed) * smooth20ms;
-        driveSmoothed += (p.drive - driveSmoothed) * smooth20ms;
 
         // Playhead.
         double scanStep = 0.0;
@@ -516,15 +595,9 @@ namespace thf::grain
         }
         globalScan = wrap01 (globalScan + scanStep);
 
-        // Grain timing and size (shared by all voices this block).
-        auto density = p.sync ? 1.0 / juce::jmax (1.0e-3, p.syncBeats * 60.0 / juce::jmax (1.0, p.bpm))
-                              : (double) p.density * modulation.densityMul;
-        density = juce::jlimit (0.1, 1000.0, density);
-        const auto interval = sampleRate / density;
-        const auto sizeSamples = juce::jlimit (0.002f * sr, 4.0f * sr, p.sizeMs * modulation.sizeMul * 0.001f * sr);
-        const auto fade = dsp::windowFade (p.window, sizeSamples, sr);
-        const auto overlap = juce::jmin ((double) maxGrainsPerVoice, density * sizeSamples / sampleRate);
-        const auto normGain = 1.0f / std::sqrt (juce::jmax (1.0f, (float) overlap * dsp::windowEnergy (fade)));
+        shape = computeShape (p);
+        linkSeed = rng.next() | 1u;
+        const auto gap = [this, &p] { return (double) ((1.0f - p.chaos) + p.chaos * rng.exponential()); };
 
         int activeVoices = 0;
         float newestOffset = -1.0f;
@@ -544,34 +617,105 @@ namespace thf::grain
             v.scanOffset = wrap01 (v.scanOffset + scanStep);
             if (v.order > newestOrder) { newestOrder = v.order; newestOffset = (float) v.scanOffset; }
 
+            // Only the knob position is smoothed; the envelope moves the cutoff directly so
+            // its attack stays sharp.
             v.filterEnv.set (sr, p.filterDecayMs);
             const auto env = v.filterEnv.advance (n);
-            const auto cutoff = juce::jlimit (10.0f, 0.49f * sr,
-                                              p.cutoff * modulation.cutoffMul * std::exp2 (p.filterEnv * 5.0f * env));
-            if (v.firstBlock) v.cutoffSmoothed = cutoff;
-            v.cutoffSmoothed *= std::exp2 (std::log2 (cutoff / v.cutoffSmoothed) * smooth5ms);
-            svfCoefs[vi].set (v.cutoffSmoothed, resonanceSmoothed, sr);
+            const auto base = juce::jlimit (10.0f, 0.49f * sr, p.cutoff * modulation.cutoffMul);
+            if (v.firstBlock) v.cutoffSmoothed = base;
+            v.cutoffSmoothed *= std::exp2 (std::log2 (base / v.cutoffSmoothed) * smooth5ms);
+            const auto cutoff = juce::jlimit (10.0f, 0.49f * sr, v.cutoffSmoothed * std::exp2 (p.filterEnv * 5.0f * env));
+            svfCoefs[vi].set (cutoff, resonanceSmoothed, sr);
             v.firstBlock = false;
-
-            const bool spawning = v.amp.getStage() != dsp::Adsr::Stage::steal;
-            while (v.countdown < (double) n)
-            {
-                if (spawning)
-                    spawnGrain (vi, juce::jmax (0, (int) v.countdown), p, sizeSamples, fade, normGain);
-                const auto jitter = (1.0f - p.chaos) + p.chaos * rng.exponential();
-                v.countdown += juce::jmax (1.0, interval * jitter);
-            }
-            v.countdown -= (double) n;
         }
+
+        // Onsets. A voice being stolen spawns nothing.
+        auto spawning = [this] (const Voice& v) { return v.active && v.amp.getStage() != dsp::Adsr::Stage::steal; };
+        if (p.sync)
+        {
+            // On the beat grid (host transport or the engine's own clock), all voices together.
+            const auto beatsPerSample = juce::jmax (1.0, p.bpm) / (60.0 * sampleRate);
+            const auto spacing = juce::jmax (1.0e-3, p.syncBeats);
+            const auto b0 = beatClock, b1 = beatClock + n * beatsPerSample;
+            for (auto tick = std::ceil (b0 / spacing - 1.0e-9) * spacing; tick < b1; tick += spacing)
+            {
+                const auto offset = juce::jlimit (0.0, (double) n - 1.0, (tick - b0) / beatsPerSample);
+                // Chaos delays an onset by up to half an interval instead of moving the grid.
+                const auto sharedDelay = p.chaos * rng.uniform() * 0.5 * shape.interval;
+                if (p.linkVoices) linkDraw = draw (rng);
+                for (int vi = 0; vi < maxVoices; ++vi)
+                {
+                    auto& v = voices[(size_t) vi];
+                    if (! spawning (v) || offset < v.holdoff)
+                        continue;
+                    const auto delay = p.linkVoices ? sharedDelay : p.chaos * rng.uniform() * 0.5 * shape.interval;
+                    if (delay < 1.0)
+                        spawnGrain (vi, (int) offset, p, shape, p.linkVoices ? linkDraw : draw (rng));
+                    else
+                        v.delayed = offset + delay;
+                }
+            }
+            for (int vi = 0; vi < maxVoices; ++vi)
+            {
+                auto& v = voices[(size_t) vi];
+                if (v.delayed >= 0.0 && v.delayed < (double) n)
+                {
+                    if (spawning (v))
+                        spawnGrain (vi, (int) v.delayed, p, shape, p.linkVoices ? linkDraw : draw (rng));
+                    v.delayed = -1.0;
+                }
+                else if (v.delayed >= 0.0)
+                {
+                    v.delayed -= n;
+                }
+                v.holdoff = juce::jmax (0.0, v.holdoff - n);
+            }
+        }
+        else if (p.linkVoices)
+        {
+            // One clock and one set of random choices for every voice.
+            for (auto t = linkPhase * shape.interval; t < (double) n; t = linkPhase * shape.interval)
+            {
+                linkDraw = draw (rng);
+                for (int vi = 0; vi < maxVoices; ++vi)
+                    if (spawning (voices[(size_t) vi]) && t >= voices[(size_t) vi].holdoff)
+                        spawnGrain (vi, (int) t, p, shape, linkDraw);
+                linkPhase += gap();
+            }
+            linkPhase -= n / shape.interval;
+            for (auto& v : voices)
+                v.holdoff = juce::jmax (0.0, v.holdoff - n);
+        }
+        else
+        {
+            // Each voice runs its own clock in units of the current interval, so a new
+            // Density applies at once instead of after the onset already scheduled.
+            for (int vi = 0; vi < maxVoices; ++vi)
+            {
+                auto& v = voices[(size_t) vi];
+                if (! v.active)
+                    continue;
+                for (auto t = v.phase * shape.interval; t < (double) n; t = v.phase * shape.interval)
+                {
+                    if (spawning (v))
+                        spawnGrain (vi, (int) t, p, shape, draw (rng));
+                    v.phase += gap();
+                }
+                v.phase -= n / shape.interval;
+            }
+        }
+
+        beatClock += n * juce::jmax (1.0, p.bpm) / (60.0 * sampleRate);
 
         const auto shownScan = p.perNoteScan && newestOffset >= 0.0f ? (double) newestOffset : globalScan;
         playheadForUi.store (wrap01 ((double) p.position + shownScan), std::memory_order_relaxed);
         activeVoicesForUi.store (activeVoices, std::memory_order_relaxed);
     }
 
-    void GrainEngine::renderGrains (int n, bool hq)
+    template <typename Kernel>
+    void GrainEngine::renderGrains (int n, const Kernel& k)
     {
-        constexpr int margin = SourceData::padding - 2 * dsp::SincTable::halfTaps - 4;
+        constexpr int margin = SourceData::padding - Kernel::reach - 2;
         const auto fadeScale = 1.0f / (float) switchFadeSamples;
 
         int active = 0;
@@ -589,41 +733,35 @@ namespace thf::grain
             const auto* srcL = src->channel (g.level, 0);
             const auto* srcR = src->channel (g.level, 1);
             const auto levelLength = src->getLevelLength (g.level);
+            float energy = 0.0f;
+            float scratch[(size_t) Kernel::taps];
 
             for (int i = g.startOffset; i < n; ++i)
             {
                 if (g.age >= g.length)
                     break;
-                auto w = windowTable.value ((float) g.age * g.invLength, g.fade);
+                auto w = windowTable.value ((float) g.age * g.invLength, g.fade, g.invFade);
                 if (g.fadeOut > 0)
                 {
                     w *= (float) g.fadeOut * fadeScale;
                     if (--g.fadeOut == 0) { g.age = g.length; break; }
                 }
                 const auto ip = (int) std::floor (g.readPos);
-                const auto frac = (float) (g.readPos - ip);
                 float l = 0.0f, r = 0.0f;
                 if (ip > -margin && ip < levelLength + margin)
                 {
-                    if (hq)
-                    {
-                        float weights[dsp::SincTable::maxWeights];
-                        int first = 0;
-                        const auto count = sincTable.weights (frac, g.stretch, 1.0f / g.stretch, weights, first);
-                        l = dsp::SincTable::dot (srcL + ip + first, weights, count);
-                        r = stereoSource ? dsp::SincTable::dot (srcR + ip + first, weights, count) : l;
-                    }
-                    else
-                    {
-                        l = dsp::hermite (srcL + ip, frac);
-                        r = stereoSource ? dsp::hermite (srcR + ip, frac) : l;
-                    }
+                    const auto* weights = k.weights ((float) (g.readPos - ip), scratch);
+                    if (stereoSource) Kernel::dot2 (srcL + ip, srcR + ip, weights, l, r);
+                    else              r = l = Kernel::dot (srcL + ip, weights);
                 }
-                outL[i] += l * w * g.gainL;
-                outR[i] += r * w * g.gainR;
+                const auto cl = l * w * g.gainL, cr = r * w * g.gainR;
+                outL[i] += cl;
+                outR[i] += cr;
+                energy += cl * cl + cr * cr;
                 g.readPos += g.step;
                 ++g.age;
             }
+            voices[(size_t) g.voice].energy += energy;
             g.startOffset = 0;
             if (g.age >= g.length)
             {
@@ -644,11 +782,24 @@ namespace thf::grain
         if (gainSmoothed < 0.0f)
             gainSmoothed = p.outputGain;
 
-        const auto filterType = (dsp::Svf::Type) juce::jlimit (0, 2, p.filterType);
+        const auto requestedType = juce::jlimit (0, 2, p.filterType);
+        if (filterTypeNow < 0)
+        {
+            filterTypeNow = requestedType;
+        }
+        else if (requestedType != filterTypeNow)
+        {
+            filterTypePrevious = filterTypeNow;
+            filterTypeNow = requestedType;
+            typeFadeLeft = typeFadeLength;
+        }
+        const auto typeNow = (dsp::Svf::Type) filterTypeNow;
+        const auto typePrevious = (dsp::Svf::Type) filterTypePrevious;
+
         int done = 0;
         while (done < n)
         {
-            const auto len = juce::jmin (controlBlock, n - done);
+            const auto len = juce::jmin (controlLength, n - done);
             processControl (p, len);
 
             for (int v = 0; v < maxVoices; ++v)
@@ -656,24 +807,56 @@ namespace thf::grain
                     for (int ch = 0; ch < 2; ++ch)
                         std::fill (voiceBuffer[v][ch], voiceBuffer[v][ch] + len, 0.0f);
 
-            renderGrains (len, p.hq);
+            if (p.hq) renderGrains (len, kernelHq);
+            else      renderGrains (len, kernel);
 
             auto* L = left + done;
             auto* R = right + done;
             std::fill (L, L + len, 0.0f);
             std::fill (R, R + len, 0.0f);
 
+            // Weight of the previous filter type while a type change crossfades.
+            const bool typeFading = typeFadeLeft > 0;
+            for (int i = 0; i < len; ++i)
+                typeMix[i] = typeFadeLeft > i ? (float) (typeFadeLeft - i) / (float) typeFadeLength : 0.0f;
+            typeFadeLeft = juce::jmax (0, typeFadeLeft - len);
+
+            const auto powerSmoothing = 1.0f - std::exp (-(float) len / (0.05f * (float) sampleRate));
             for (int vi = 0; vi < maxVoices; ++vi)
             {
                 auto& v = voices[(size_t) vi];
                 if (! v.active)
                     continue;
+
+                // Coherent grains (same material, same phase) add up louder than the
+                // uncorrelated sum the normalisation assumes; bring such clouds down to the
+                // level of the sum of their grain powers. Attenuation only.
+                float power = 0.0f;
+                for (int i = 0; i < len; ++i)
+                    power += voiceBuffer[vi][0][i] * voiceBuffer[vi][0][i] + voiceBuffer[vi][1][i] * voiceBuffer[vi][1][i];
+                v.powerSmoothed += (power - v.powerSmoothed) * powerSmoothing;
+                v.energySmoothed += (v.energy - v.energySmoothed) * powerSmoothing;
+                v.energy = 0.0f;
+                constexpr float eps = 1.0e-9f;
+                const auto coherenceTarget = juce::jlimit (0.1f, 1.0f, std::sqrt ((v.energySmoothed + eps) / (v.powerSmoothed + eps)));
+                const auto coherenceStart = v.coherence;
+                const auto coherenceStep = (coherenceTarget - coherenceStart) / (float) len;
+                v.coherence = coherenceTarget;
+
                 const auto& coefs = svfCoefs[vi];
                 for (int i = 0; i < len; ++i)
                 {
-                    const auto env = v.amp.process (adsrCoefs) * v.velocityGain;
-                    L[i] += v.filter[0].process (voiceBuffer[vi][0][i], coefs, filterType) * env;
-                    R[i] += v.filter[1].process (voiceBuffer[vi][1][i], coefs, filterType) * env;
+                    const auto env = v.amp.process (adsrCoefs) * v.velocityGain * (coherenceStart + coherenceStep * (float) (i + 1));
+                    const auto outL = v.filter[0].processAll (voiceBuffer[vi][0][i], coefs);
+                    const auto outR = v.filter[1].processAll (voiceBuffer[vi][1][i], coefs);
+                    auto l = dsp::Svf::select (outL, typeNow), r = dsp::Svf::select (outR, typeNow);
+                    if (typeFading)
+                    {
+                        l += (dsp::Svf::select (outL, typePrevious) - l) * typeMix[i];
+                        r += (dsp::Svf::select (outR, typePrevious) - r) * typeMix[i];
+                    }
+                    L[i] += l * env;
+                    R[i] += r * env;
                 }
 
                 if (! v.amp.isActive())
@@ -688,20 +871,11 @@ namespace thf::grain
                 }
             }
 
-            // Drive: +0..30 dB into an anti-aliased tanh; small signals gain pre^0.25.
-            if (driveSmoothed > 1.0e-3f)
+            // Drive: +0..30 dB into an oversampled, anti-aliased tanh, blended in from zero.
             {
-                const auto pre = std::exp2 (driveSmoothed * 30.0f / 6.0206f);
-                const auto makeup = std::pow (pre, -0.75f);
-                for (int i = 0; i < len; ++i)
-                {
-                    L[i] = drive.process (0, L[i] * pre) * makeup;
-                    R[i] = drive.process (1, R[i] * pre) * makeup;
-                }
-            }
-            else
-            {
-                drive.reset();
+                const auto start = driveSmoothed;
+                driveSmoothed += (p.drive - driveSmoothed) * (1.0f - std::exp (-(float) len / (0.02f * (float) sampleRate)));
+                drive.process (L, R, len, start, driveSmoothed);
             }
 
             // Space: plate-like reverb after the drive. Dry stays at unity so switching the
@@ -745,11 +919,25 @@ namespace thf::grain
             const auto gainStep = (gainSmoothed - startGain) / (float) len;
             bool bad = false;
             const auto fadeStep = 1.0f / (0.005f * (float) sampleRate);
+            auto target = fadeTarget.load (std::memory_order_relaxed);
+            if (target <= 0.0f && fadeGain <= 0.0f)
+            {
+                fadedSamples += len;
+                if (fadedSamples > (int) (0.1 * sampleRate))
+                {
+                    fadeTarget.store (1.0f);
+                    target = 1.0f;
+                }
+            }
+            else
+            {
+                fadedSamples = 0;
+            }
             for (int i = 0; i < len; ++i)
             {
-                if (std::abs (fadeGain - fadeTarget) > 0.0f)
-                    fadeGain = fadeTarget > fadeGain ? juce::jmin (fadeTarget, fadeGain + fadeStep)
-                                                     : juce::jmax (fadeTarget, fadeGain - fadeStep);
+                if (std::abs (fadeGain - target) > 0.0f)
+                    fadeGain = target > fadeGain ? juce::jmin (target, fadeGain + fadeStep)
+                                                 : juce::jmax (target, fadeGain - fadeStep);
                 const auto gain = (startGain + gainStep * (float) (i + 1)) * headroom * fadeGain;
                 auto l = L[i] * gain, r = R[i] * gain;
                 if (p.safeClip) { l = safeClip (l); r = safeClip (r); }
@@ -761,7 +949,12 @@ namespace thf::grain
             {
                 // Something blew up (should never happen): silence and clear every state that
                 // could hold the NaN, including the reverb and the smoothers.
-                for (auto& v : voices) { v.filter[0].reset(); v.filter[1].reset(); }
+                for (auto& v : voices)
+                {
+                    v.filter[0].reset(); v.filter[1].reset();
+                    v.energy = v.energySmoothed = v.powerSmoothed = 0.0f;
+                    v.coherence = 1.0f;
+                }
                 drive.reset();
                 reverb.reset();
                 levelSmoothed = 1.0f;
@@ -769,6 +962,7 @@ namespace thf::grain
                 driveSmoothed = 0.0f;
                 resonanceSmoothed = -1.0f;
             }
+            sampleClock += len;
             done += len;
         }
         fadedOut.store (fadeGain <= 0.0f, std::memory_order_release);

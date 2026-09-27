@@ -125,3 +125,5 @@
 "The file is too large" = "Файл слишком большой"
 "Not enough memory for this file" = "Недостаточно памяти для этого файла"
 "A file with this name was found, but its audio is different" = "Найден файл с таким именем, но звук в нём другой"
+"Off" = "Выкл"
+"On" = "Вкл"

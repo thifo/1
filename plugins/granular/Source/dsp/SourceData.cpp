@@ -1,84 +1,78 @@
 #include "SourceData.h"
 #include "DspCore.h"
+#include <thread>
 
 namespace thf::grain
 {
     namespace
     {
-        // Linear-phase low-pass for 2:1 decimation. Passband to 0.21 fs keeps the top of each
-        // octave copy clean; stopband starts below the new Nyquist.
-        struct DecimationFilter
-        {
-            static constexpr int taps = 63;
-            static constexpr int centre = taps / 2;
-            std::array<float, taps> h {};
-
-            DecimationFilter()
-            {
-                constexpr double fc = 0.21, beta = 8.0;
-                auto i0 = [] (double x)
-                {
-                    double sum = 1.0, term = 1.0;
-                    for (int k = 1; k < 40; ++k) { term *= (x / (2.0 * k)) * (x / (2.0 * k)); sum += term; }
-                    return sum;
-                };
-                double total = 0.0;
-                for (int n = 0; n < taps; ++n)
-                {
-                    const double m = n - centre;
-                    const double x = 2.0 * fc * m;
-                    const double sinc = n == centre ? 1.0 : std::sin (juce::MathConstants<double>::pi * x) / (juce::MathConstants<double>::pi * x);
-                    const double r = m / centre;
-                    const double w = i0 (beta * std::sqrt (std::max (0.0, 1.0 - r * r))) / i0 (beta);
-                    h[(size_t) n] = (float) (2.0 * fc * sinc * w);
-                    total += h[(size_t) n];
-                }
-                for (auto& v : h) v = (float) (v / total);
-            }
-        };
-
         juce::AudioBuffer<float> padded (int channels, int length)
         {
             juce::AudioBuffer<float> b (channels, length + 2 * SourceData::padding);
             b.clear();
             return b;
         }
-    }
 
-    namespace
-    {
-        // Offline band-limited rate conversion with the same Kaiser sinc as HQ grains; the
-        // kernel is stretched when reducing the rate, so nothing folds back.
-        juce::AudioBuffer<float> resample (const juce::AudioBuffer<float>& in, double from, double to)
+        // Band-limited conversion of x (at rate `from`) to rate `to`, passing content up to
+        // cutoffHz (<= 0.45 of `from`): the Kaiser sinc is stretched to move its cutoff down.
+        // Ratios of 1/2, 1, 2, 4, ... (the copy cascade) use precomputed taps.
+        void resample (const float* x, int inLength, double from, double to, double cutoffHz, float* y, int outLength)
         {
             static const dsp::SincTable sinc;
-            const auto ratio = from / to;                            // input samples per output sample
-            const auto stretch = juce::jmax (1.0, ratio);
+            const auto ratio = from / to;                                   // input samples per output sample
+            const auto stretch = juce::jmax (1.0, 0.45 * from / cutoffHz);
             const auto reach = (int) std::ceil (dsp::SincTable::halfTaps * stretch) + 1;
-            const auto inLength = in.getNumSamples();
-            const auto outLength = juce::jmax (1, (int) std::llround ((double) inLength / ratio));
-            juce::AudioBuffer<float> out (in.getNumChannels(), outLength);
             const auto invStretch = (float) (1.0 / stretch);
-            for (int ch = 0; ch < in.getNumChannels(); ++ch)
+
+            if (std::abs (ratio * 2.0 - std::round (ratio * 2.0)) < 1.0e-9)
             {
-                const auto* x = in.getReadPointer (ch);
-                auto* y = out.getWritePointer (ch);
+                // Output positions fall on whole or half input samples: two rows of taps.
+                const auto taps = 2 * reach;
+                std::vector<float> rows ((size_t) (2 * taps));
+                for (int phase = 0; phase < 2; ++phase)
+                    for (int t = 0; t < taps; ++t)
+                        rows[(size_t) (phase * taps + t)] = sinc.kernel (((float) (t - reach + 1) - 0.5f * (float) phase) * invStretch) * invStretch;
+                const auto twice = (int) std::round (ratio * 2.0);
                 for (int i = 0; i < outLength; ++i)
                 {
-                    const auto pos = (double) i * ratio;
-                    const auto base = (int) std::floor (pos);
-                    const auto frac = (float) (pos - base);
+                    const auto half = (juce::int64) i * twice;
+                    const auto base = (int) (half / 2);
+                    const auto* h = rows.data() + (half % 2) * taps;
+                    const auto first = base - reach + 1;
+                    const auto lo = juce::jmax (0, -first), hi = juce::jmin (taps, inLength - first);
                     float sum = 0.0f;
-                    for (int k = -reach + 1; k <= reach; ++k)
-                    {
-                        const auto idx = base + k;
-                        if (idx >= 0 && idx < inLength)
-                            sum += x[idx] * sinc.kernel (((float) k - frac) * invStretch);
-                    }
-                    y[i] = sum * invStretch;
+                    for (int t = lo; t < hi; ++t)
+                        sum += x[first + t] * h[t];
+                    y[i] = sum;
                 }
+                return;
             }
-            return out;
+
+            for (int i = 0; i < outLength; ++i)
+            {
+                const auto pos = (double) i * ratio;
+                const auto base = (int) std::floor (pos);
+                const auto frac = (float) (pos - base);
+                const auto lo = juce::jmax (-reach + 1, -base), hi = juce::jmin (reach, inLength - 1 - base);
+                float sum = 0.0f;
+                for (int k = lo; k <= hi; ++k)
+                    sum += x[base + k] * sinc.kernel (((float) k - frac) * invStretch);
+                y[i] = sum * invStretch;
+            }
+        }
+
+        // Runs job(0..count-1) on a few threads (loading happens off the audio thread).
+        void parallelFor (int count, const std::function<void (int)>& job)
+        {
+            const auto threads = juce::jlimit (1, 8, juce::jmin (count, (int) std::thread::hardware_concurrency()));
+            std::atomic<int> next { 0 };
+            auto worker = [&] { for (int i; (i = next.fetch_add (1)) < count;) job (i); };
+            std::vector<std::thread> pool;
+            for (int t = 1; t < threads; ++t)
+                pool.emplace_back (worker);
+            worker();
+            for (auto& t : pool)
+                t.join();
         }
 
         // DC and sub-sonic rumble out: mean removed, then a 5 Hz one-pole high-pass run
@@ -113,69 +107,69 @@ namespace thf::grain
                                             double targetRate)
     {
         rate = rate > 0.0 ? rate : 48000.0;
-        const bool convert = targetRate > 0.0 && std::abs (targetRate - rate) > 0.01 && input.getNumSamples() > 0;
-        const auto converted = convert ? resample (input, rate, targetRate) : juce::AudioBuffer<float>();
-        const auto& audio = convert ? converted : input;
+        const auto inLength = input.getNumSamples();
+        const bool convert = targetRate > 0.0 && std::abs (targetRate - rate) > 0.01 && inLength > 0;
 
         Ptr s (new SourceData());
-        s->numChannels = juce::jlimit (1, 2, audio.getNumChannels());
-        s->length = juce::jmax (1, audio.getNumSamples());
+        s->numChannels = juce::jlimit (1, 2, input.getNumChannels());
         s->sampleRate = convert ? targetRate : rate;
+        s->length = juce::jmax (1, convert ? (int) std::llround ((double) inLength * targetRate / rate) : inLength);
         s->originalRate = rate;
         s->name = sourceName;
 
-        // Level 0: sanitised copy without DC.
-        auto level0 = padded (s->numChannels, s->length);
-        for (int ch = 0; ch < s->numChannels; ++ch)
+        // Clean copy at the original rate: finite, limited, no DC.
+        juce::AudioBuffer<float> clean (s->numChannels, juce::jmax (1, inLength));
+        clean.clear();
+        for (int ch = 0; ch < s->numChannels && inLength > 0; ++ch)
         {
-            auto* dst = level0.getWritePointer (ch) + padding;
-            if (audio.getNumSamples() == 0)
-                break;
-            const auto* src = audio.getReadPointer (ch);
-            for (int i = 0; i < s->length; ++i)
+            const auto* src = input.getReadPointer (juce::jmin (ch, input.getNumChannels() - 1));
+            auto* dst = clean.getWritePointer (ch);
+            for (int i = 0; i < inLength; ++i)
                 dst[i] = std::isfinite (src[i]) ? juce::jlimit (-4.0f, 4.0f, src[i]) : 0.0f;
-            removeDc (dst, s->length, s->sampleRate);
+            removeDc (dst, inLength, rate);
         }
-        s->levels.push_back (std::move (level0));
-        s->levelLengths.push_back (s->length);
 
-        // Octave copies.
-        static const DecimationFilter filter;
-        for (int level = 1; level < maxLevels; ++level)
+        // Grain copies, each at twice its own rate and band-limited to a quarter of that
+        // (half-octave steps), built straight from the original.
+        for (int level = 0; level < maxLevels; ++level)
         {
-            const auto prevLength = s->levelLengths.back();
-            // Every level is built, even for tiny sources: the grain reader relies on the
-            // top level bringing any ratio <= 32 down to an effective ratio <= 1.
-            const auto newLength = juce::jmax (1, (prevLength + 1) / 2);
-            auto next = padded (s->numChannels, newLength);
-            const auto& prev = s->levels.back();
-            for (int ch = 0; ch < s->numChannels; ++ch)
+            const auto n = juce::jmax (1, (int) std::ceil ((double) s->length * levelScale (level)));
+            s->levels.push_back (padded (s->numChannels, n));
+            s->levelLengths.push_back (n);
+        }
+        if (inLength > 0)
+        {
+            // Copies 0 and 1 from the original; then each copy from the one two steps up (half
+            // its rate, whole-sample positions): two independent cascades per channel.
+            auto build = [&] (int level, int ch, const float* from, int fromLength, double fromRate)
             {
-                const auto* src = prev.getReadPointer (ch) + padding;
-                auto* dst = next.getWritePointer (ch) + padding;
-                for (int m = 0; m < newLength; ++m)
-                {
-                    float sum = 0.0f;
-                    for (int k = 0; k < DecimationFilter::taps; ++k)
-                    {
-                        const int idx = 2 * m + DecimationFilter::centre - k;
-                        if (idx >= 0 && idx < prevLength)
-                            sum += filter.h[(size_t) k] * src[idx];
-                    }
-                    dst[m] = sum;
-                }
-            }
-            s->levels.push_back (std::move (next));
-            s->levelLengths.push_back (newLength);
+                const auto storageRate = s->sampleRate * levelScale (level);
+                const auto cutoff = juce::jmin (0.45 * fromRate, contentFraction * storageRate);
+                resample (from, fromLength, fromRate, storageRate, cutoff,
+                          s->levels[(size_t) level].getWritePointer (ch) + padding, s->levelLengths[(size_t) level]);
+            };
+            parallelFor (2 * s->numChannels, [&] (int job)
+            {
+                const auto level = job / s->numChannels, ch = job % s->numChannels;
+                build (level, ch, clean.getReadPointer (ch), inLength, rate);
+            });
+            parallelFor (2 * s->numChannels, [&] (int job)
+            {
+                const auto chain = job / s->numChannels, ch = job % s->numChannels;
+                for (int level = chain + 2; level < maxLevels; level += 2)
+                    build (level, ch, s->channel (level - 2, ch), s->levelLengths[(size_t) level - 2],
+                           s->sampleRate * levelScale (level - 2));
+            });
         }
 
         // Level normalisation: peak to 0.7 (-3 dBFS), never more than +30 dB.
+        const auto length0 = s->levelLengths[0];
         {
             float peak = 0.0f;
             for (int ch = 0; ch < s->numChannels; ++ch)
             {
                 const auto* d = s->channel (0, ch);
-                for (int i = 0; i < s->length; ++i)
+                for (int i = 0; i < length0; ++i)
                     peak = juce::jmax (peak, std::abs (d[i]));
             }
             s->normalGain = peak > 1.0e-6f ? juce::jmin (31.6f, 0.7f / peak) : 1.0f;
@@ -186,13 +180,13 @@ namespace thf::grain
         s->peakMax.assign (overviewSize, 0.0f);
         for (int b = 0; b < overviewSize; ++b)
         {
-            const auto start = (int) ((int64_t) b * s->length / overviewSize);
-            const auto end = juce::jmax (start + 1, (int) ((int64_t) (b + 1) * s->length / overviewSize));
+            const auto start = (int) ((int64_t) b * length0 / overviewSize);
+            const auto end = juce::jmax (start + 1, (int) ((int64_t) (b + 1) * length0 / overviewSize));
             float lo = 0.0f, hi = 0.0f;
             for (int ch = 0; ch < s->numChannels; ++ch)
             {
                 const auto* d = s->channel (0, ch);
-                for (int i = start; i < juce::jmin (end, s->length); ++i)
+                for (int i = start; i < juce::jmin (end, length0); ++i)
                 {
                     lo = juce::jmin (lo, d[i]);
                     hi = juce::jmax (hi, d[i]);
@@ -202,14 +196,6 @@ namespace thf::grain
             s->peakMax[(size_t) b] = hi;
         }
         return s;
-    }
-
-    juce::AudioBuffer<float> SourceData::copyOriginal() const
-    {
-        juce::AudioBuffer<float> out (numChannels, length);
-        for (int ch = 0; ch < numChannels; ++ch)
-            out.copyFrom (ch, 0, channel (0, ch), length);
-        return out;
     }
 
     namespace sources
@@ -247,7 +233,10 @@ namespace thf::grain
                     return nullptr;
                 }
                 const auto channels = juce::jlimit (1, 2, (int) reader->numChannels);
-                if (reader->lengthInSamples * channels > juce::jmin (options.maxSamples, maxTotalSamples))
+                // Budget at the rate the sample will play at (the grain copies take ~6.7x this).
+                const auto playRate = options.targetRate > 0.0 ? options.targetRate : reader->sampleRate;
+                if ((double) reader->lengthInSamples * playRate / reader->sampleRate * channels
+                        > (double) juce::jmin (options.maxSamples, maxTotalSamples))
                 {
                     error = "The file is too large";
                     return nullptr;
@@ -722,8 +711,7 @@ namespace thf::grain
             std::vector<float> mono ((size_t) length);
             for (int ch = 0; ch < s.getNumChannels(); ++ch)
             {
-                const auto* d = s.channel (0, ch) + first;
-                for (int i = 0; i < length; ++i) mono[(size_t) i] += d[i];
+                for (int i = 0; i < length; ++i) mono[(size_t) i] += s.sample (ch, first + i);
             }
 
             std::vector<std::pair<float, int>> energies;

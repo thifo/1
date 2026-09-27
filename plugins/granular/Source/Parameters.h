@@ -70,6 +70,7 @@ namespace thf::grain
         inline constexpr const char* output     = "output";
         inline constexpr const char* safeClip   = "safeClip";
         inline constexpr const char* hq         = "hq";
+        inline constexpr const char* linkVoices = "linkVoices";
     }
 
     // Choice lists (order is part of the saved state: append only). Hosts store automation of a

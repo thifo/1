@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DspCore.h"
+#include "DriveStage.h"
 #include "SourceData.h"
 #include <atomic>
 
@@ -20,9 +21,10 @@ namespace thf::grain
         float spray = 0.04f;        // 0..1 of the region, centred on the playhead
         float sizeMs = 120.0f;
         float density = 24.0f;      // grains per second per voice
-        bool sync = false;
+        bool sync = false;          // onsets on the tempo grid (host transport when it runs)
         double syncBeats = 0.25;
         double bpm = 120.0;
+        bool linkVoices = false;    // all voices share onsets and random choices; only pitch differs
         float chaos = 0.3f;         // 0 = regular onsets, 1 = Poisson
         float window = 0.0f;        // 0 = Hann .. 1 = nearly rectangular
         float pitch = 0.0f;         // semitones, including fine tune
@@ -70,6 +72,7 @@ namespace thf::grain
         float seconds = 0;      // grain duration
         int voice = 0;
         bool reversed = false;
+        int64_t time = 0;       // engine sample clock at the grain's first sample
     };
 
     class GrainEngine
@@ -78,7 +81,8 @@ namespace thf::grain
         static constexpr int maxVoices = 16;
         static constexpr int maxGrainsPerVoice = 48;
         static constexpr int maxGrains = maxVoices * maxGrainsPerVoice;   // no voice ever starves
-        static constexpr int controlBlock = 32;     // samples between parameter/LFO updates
+        static constexpr int maxControlBlock = 128; // longest render slice; parameters and LFO
+                                                    // update every ~0.67 ms at any rate
 
         GrainEngine();
 
@@ -102,11 +106,15 @@ namespace thf::grain
         void setModWheel (float unipolar) noexcept  { modWheel = unipolar; }
         void resetScan() noexcept;
         // 5 ms fade of the whole output (bulk parameter changes). isFadedOut() is true once
-        // the output has reached silence; any thread may read it.
-        void setFadedOut (bool out) noexcept { fadeTarget = out ? 0.0f : 1.0f; }
+        // the output has reached silence; any thread may read it. The output comes back by
+        // itself after 100 ms of audio if nobody releases it (a blocked message thread).
+        void setFadedOut (bool out) noexcept { fadeTarget.store (out ? 0.0f : 1.0f); }
         bool isFadedOut() const noexcept     { return fadedOut.load (std::memory_order_acquire); }
+        // Once per host block: where the song is. While the transport runs, Sync onsets sit on
+        // its beat grid; otherwise the engine keeps its own clock (restarted by a new phrase).
+        void setTransport (bool playing, double ppqPosition) noexcept;
         // Called once per host block when the LFO follows the transport.
-        void syncLfo (double ppqPosition, double beatsPerCycle) noexcept { lfo.setPhase (ppqPosition / beatsPerCycle); }
+        void syncLfo (double ppqPosition, double beatsPerCycle) noexcept { lfo.setPhase (ppqPosition / beatsPerCycle, rng); }
 
         // Nearest allowed interval for a random pitch offset (semitones).
         static float quantizeInterval (float semitones, int mode) noexcept;
@@ -126,15 +134,21 @@ namespace thf::grain
             bool active = false;
             int voice = 0;
             int level = 0;
-            double readPos = 0;     // in samples of `level`
+            double readPos = 0;     // in samples of copy `level`
             double step = 1;
-            float stretch = 1;      // sinc stretch (HQ)
             int age = 0, length = 1, startOffset = 0;
-            float invLength = 1, fade = 0.5f;
+            float invLength = 1, fade = 0.5f, invFade = 2.0f;
             float gainL = 1, gainR = 1;
             const SourceData* src = nullptr;
             int fadeOut = 0;        // > 0: samples left of a fade-out (source switch)
         };
+
+        // The random choices of one grain, drawn in a fixed order (reproducible renders);
+        // linked voices share them.
+        struct GrainDraw { float jitter = 0, spray = 0, reverse = 1, pan = 0; };
+
+        // Grain length, window and gain for this control block.
+        struct GrainShape { float sizeSamples = 0, fade = 0.5f, normGain = 1; double interval = 1; };
 
         struct Voice
         {
@@ -145,14 +159,19 @@ namespace thf::grain
             dsp::Adsr amp;
             dsp::FilterEnvelope filterEnv;
             dsp::Svf filter[2];
-            double countdown = 0;
+            double phase = 0;       // intervals until the next onset (free timing)
+            double delayed = -1;    // samples until a chaos-delayed Sync onset, -1 = none
+            double holdoff = 0;     // samples during which Sync ticks are skipped (note-on grain)
             double scanOffset = 0;
             float currentNote = 60, targetNote = 60;
             int grains = 0;
             float cutoffSmoothed = 1000;
             bool firstBlock = true;
 
-            // Voice stealing: the new note waits for a 3 ms fade of the old one.
+            // Loudness of coherent grains: power of the grain sum vs. sum of grain powers.
+            float energy = 0, energySmoothed = 0, powerSmoothed = 0, coherence = 1;
+
+            // Voice stealing: the new note waits for the fade of the old one.
             int pendingNote = -1;
             float pendingVelocityGain = 1;
             bool pendingKeyDown = false;
@@ -166,13 +185,17 @@ namespace thf::grain
         void startVoice (Voice&, int note, float velocityGain, bool keyDown, const EngineParams&);
         int allocateVoice (const EngineParams&);
         void releaseVoice (Voice&);
+        float stealSamples (int note) const noexcept;
+        GrainShape computeShape (const EngineParams&) const;
+        GrainDraw draw (dsp::Random&) noexcept;
         void processControl (const EngineParams&, int n);
-        void spawnGrain (int voiceIndex, int offset, const EngineParams&, float sizeSamples, float fade, float normGain);
-        void renderGrains (int n, bool hq);
+        Grain* spawnGrain (int voiceIndex, int offset, const EngineParams&, const GrainShape&, const GrainDraw&);
+        template <typename Kernel> void renderGrains (int n, const Kernel&);
         void killGrains (int voiceIndex);
         float velocityGain (float velocity, const EngineParams&) const;
 
         double sampleRate = 48000.0;
+        int controlLength = 32;
         uint32_t seed_ = 0x7f4a7c15u;
         const SourceData* source = nullptr;
         SourceData::Ptr heldSource, heldPrevious;
@@ -180,16 +203,19 @@ namespace thf::grain
         int switchFadeSamples = 384;
         dsp::Random rng;
         dsp::WindowTable windowTable;
-        dsp::SincTable sincTable;
+        dsp::GrainKernel kernel { 7.0, 0.8 };
+        dsp::GrainKernelHq kernelHq { 9.0, 0.8 };
         dsp::Lfo lfo;
         dsp::AdsrCoefs adsrCoefs;
         dsp::SvfCoefs svfCoefs[maxVoices];
-        dsp::Drive drive;
+        dsp::DriveStage drive;
         juce::Reverb reverb;
         juce::Reverb::Parameters reverbParams;
         int reverbTail = 0;          // samples to keep running the reverb after Space goes to 0
         float levelSmoothed = 1.0f;
-        float fadeGain = 1.0f, fadeTarget = 1.0f;
+        float fadeGain = 1.0f;
+        std::atomic<float> fadeTarget { 1.0f };
+        int fadedSamples = 0;
         std::atomic<bool> fadedOut { false };
 
         std::array<Voice, maxVoices> voices {};
@@ -200,6 +226,20 @@ namespace thf::grain
         std::array<std::pair<int, float>, 32> monoStack {};
         int monoCount = 0;
 
+        // Timing shared by all voices.
+        GrainShape shape;
+        double beatClock = 0.0;      // beats; follows the host while its transport runs
+        bool hostPlaying = false;
+        double linkPhase = 0.0;      // free timing of linked voices
+        double linkDelayed = -1.0;
+        GrainDraw linkDraw;
+        uint32_t linkSeed = 1;       // note-on grains of linked voices started together match
+        int64_t sampleClock = 0;
+
+        // Filter type changes crossfade over 5 ms.
+        int filterTypeNow = -1, filterTypePrevious = 0, typeFadeLeft = 0, typeFadeLength = 240;
+        float typeMix[maxControlBlock] {};
+
         double globalScan = 0.0;
         bool sustainPedal = false, holdOn = false;
         float bend = 0.0f, modWheel = 0.0f;
@@ -208,7 +248,7 @@ namespace thf::grain
         float driveSmoothed = 0.0f, gainSmoothed = 1.0f, resonanceSmoothed = 0.1f;
 
         // Per-voice scratch for one control block.
-        float voiceBuffer[maxVoices][2][controlBlock] {};
+        float voiceBuffer[maxVoices][2][maxControlBlock] {};
 
         std::atomic<float> playheadForUi { 0.0f };
         std::atomic<int> activeVoicesForUi { 0 }, activeGrainsForUi { 0 };

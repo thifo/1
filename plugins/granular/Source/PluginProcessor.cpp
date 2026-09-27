@@ -69,7 +69,7 @@ namespace thf::grain
             filterDecay = get (pid::filterDecay); drive = get (pid::drive); lfoRate = get (pid::lfoRate);
             lfoDepth = get (pid::lfoDepth); lfoShape = get (pid::lfoShape); lfoTarget = get (pid::lfoTarget);
             modTarget = get (pid::modTarget); modDepth = get (pid::modDepth); output = get (pid::output);
-            safeClip = get (pid::safeClip); hq = get (pid::hq);
+            safeClip = get (pid::safeClip); hq = get (pid::hq); linkVoices = get (pid::linkVoices);
         }
 
         std::atomic<float> *source, *root, *position, *scan, *scanMode, *freeze, *spray, *size, *density,
@@ -77,7 +77,8 @@ namespace thf::grain
             *voiceMode, *glide, *hold, *bendRange, *velocity, *attack, *decay, *sustain, *release,
             *filterType, *cutoff, *resonance, *filterEnv, *filterDecay, *drive, *lfoRate, *lfoDepth,
             *lfoShape, *lfoTarget, *modTarget, *modDepth, *output, *safeClip, *hq,
-            *quantize, *lfoMode, *lfoDivision, *space, *spaceSize, *regionStart, *regionEnd, *normalize;
+            *quantize, *lfoMode, *lfoDivision, *space, *spaceSize, *regionStart, *regionEnd, *normalize,
+            *linkVoices;
     };
 
     //==============================================================================
@@ -175,6 +176,8 @@ namespace thf::grain
         p.sizeMs = r.size->load();
         p.density = r.density->load();
         p.sync = r.sync->load() > 0.5f;
+        p.linkVoices = r.linkVoices->load() > 0.5f;
+        p.bpm = hostBpm;
         p.syncBeats = syncRateBeats[juce::jlimit (0, (int) std::size (syncRateBeats) - 1, (int) r.syncRate->load())];
         p.chaos = r.chaos->load();
         p.window = r.window->load();
@@ -232,17 +235,26 @@ namespace thf::grain
         const auto sourceChoice = (int) raw->source->load();
         engine.setSource (sourceChoice == 0 ? audioSource.get() : factory->get (sourceChoice));
 
+        // Transport: tempo for Sync and the LFO, song position for the beat grid.
+        {
+            bool playing = false;
+            double ppq = 0.0;
+            if (auto* ph = getPlayHead())
+                if (auto pos = ph->getPosition())
+                {
+                    if (auto bpm = pos->getBpm())
+                        hostBpm = juce::jlimit (20.0, 999.0, *bpm);
+                    if (auto position = pos->getPpqPosition(); position && pos->getIsPlaying())
+                    {
+                        playing = true;
+                        ppq = *position;
+                    }
+                }
+            engine.setTransport (playing, ppq);
+            if (playing && raw->lfoMode->load() > 0.5f)
+                engine.syncLfo (ppq, lfoDivisionBeats[juce::jlimit (0, (int) std::size (lfoDivisionBeats) - 1, (int) raw->lfoDivision->load())]);
+        }
         auto engineParams = makeEngineParams();
-        if (auto* ph = getPlayHead())
-            if (auto pos = ph->getPosition())
-            {
-                if (auto bpm = pos->getBpm())
-                    engineParams.bpm = *bpm;
-                // A synced LFO follows the song position while the transport runs.
-                if (engineParams.lfoSync && pos->getIsPlaying())
-                    if (auto ppq = pos->getPpqPosition())
-                        engine.syncLfo (*ppq, engineParams.lfoBeats);
-            }
         engine.setHold (raw->hold->load() > 0.5f);
         if (scanResetRequested.exchange (false))
             engine.resetScan();
@@ -253,7 +265,7 @@ namespace thf::grain
 
         auto* left = buffer.getWritePointer (0);
         auto* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
-        float scratch[GrainEngine::controlBlock];
+        float scratch[GrainEngine::maxControlBlock];
 
         // Render between MIDI events so notes and controls land sample-accurately.
         int rendered = 0;
@@ -261,7 +273,7 @@ namespace thf::grain
         {
             while (rendered < end)
             {
-                const auto n = juce::jmin (end - rendered, GrainEngine::controlBlock);
+                const auto n = juce::jmin (end - rendered, GrainEngine::maxControlBlock);
                 engine.render (left + rendered, right != nullptr ? right + rendered : scratch, n, engineParams);
                 rendered += n;
             }

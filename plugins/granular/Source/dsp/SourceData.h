@@ -5,15 +5,21 @@
 
 namespace thf::grain
 {
-    // An immutable, ready-to-play grain source: the audio plus band-limited octave copies
-    // ("mip levels") used to pitch grains up without aliasing, and a peak overview for the
-    // waveform display. Built off the audio thread, then handed over by reference count.
+    // An immutable, ready-to-play grain source: band-limited copies of the audio that grains
+    // read from, and a peak overview for the waveform display. Built off the audio thread,
+    // then handed over by reference count.
+    //
+    // Copy j is stored at 2 * 2^(-j/2) times the sample's rate and holds content up to a
+    // quarter of its own rate. A grain reads the copy that needs at most 2 stored samples per
+    // output sample: nothing folds back above Nyquist, the top of the band is at least 0.33 of
+    // the output rate, and the 2x storage lets a short kernel remove interpolation images.
     class SourceData : public juce::ReferenceCountedObject
     {
     public:
         using Ptr = juce::ReferenceCountedObjectPtr<SourceData>;
 
-        static constexpr int maxLevels = 6;       // 1, 1/2, ..., 1/32 of the original rate
+        static constexpr int maxLevels = 11;      // half-octave steps: pitch up to +5 octaves
+        static constexpr double contentFraction = 0.23;   // of each copy's storage rate
         static constexpr int padding = 48;        // zeros around each level for interpolation
         static constexpr int overviewSize = 2048; // peak buckets for the display
 
@@ -28,16 +34,18 @@ namespace thf::grain
         double getDurationSeconds() const noexcept { return (double) length / sampleRate; }
         int getNumLevels() const noexcept       { return (int) levels.size(); }
         int getLevelLength (int level) const noexcept { return levelLengths[(size_t) level]; }
+        // Stored samples of copy `level` per sample of the source.
+        static double levelScale (int level) noexcept { return 2.0 * std::exp2 (-0.5 * level); }
         const juce::String& getName() const noexcept  { return name; }
 
-        // Pointer to sample 0 of a level; indices -padding .. length+padding-1 are readable.
+        // Pointer to sample 0 of a copy; indices -padding .. length+padding-1 are readable.
         const float* channel (int level, int ch) const noexcept
         {
             return levels[(size_t) level].getReadPointer (juce::jmin (ch, numChannels - 1)) + padding;
         }
 
-        // The original audio, unpadded (for saving into a session).
-        juce::AudioBuffer<float> copyOriginal() const;
+        // The audio at the source's own rate (analysis, tests): every other sample of copy 0.
+        float sample (int ch, int index) const noexcept { return channel (0, ch)[2 * index]; }
 
         // Gain that brings the sample's peak to the level of the built-in sources (-3 dBFS).
         float getNormalGain() const noexcept { return normalGain; }
@@ -70,9 +78,10 @@ namespace thf::grain
     // Loading and generation helpers (message or background thread only).
     namespace sources
     {
-        // Limits for files: length and memory (frames x channels, before octave copies).
+        // Limits for files: length and memory (frames x channels at the playback rate; the
+        // grain copies take about 6.7 times that in floats, ~640 MB at the limit).
         inline constexpr double maxFileSeconds = 600.0;
-        inline constexpr juce::int64 maxTotalSamples = 64 * 1024 * 1024;
+        inline constexpr juce::int64 maxTotalSamples = 24 * 1024 * 1024;
         // Samples up to this length travel inside the session (FLAC of the original audio).
         inline constexpr double maxEmbedSeconds = 60.0;
 

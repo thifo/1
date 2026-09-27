@@ -164,6 +164,7 @@ namespace thf::grain
 
         // Fills engine parameters from the current parameter values.
         EngineParams makeEngineParams() const;
+        double hostBpm = 120.0;       // audio thread
 
         static constexpr int stateVersion = 1;
 

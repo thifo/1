@@ -5,6 +5,7 @@
 #include <SampleLibrary.h>
 #include <i18n/Translator.h>
 #include <juce_dsp/juce_dsp.h>
+#include <map>
 
 namespace thf::test
 {
@@ -89,6 +90,32 @@ namespace
         return (best + shift) * sr / size;
     }
 
+    // Energy away from the harmonics of f0 (within +/- tolerance Hz) relative to the energy on
+    // them, over 2^15 samples from `from`, Blackman-Harris windowed.
+    double offHarmonicDb (const std::vector<float>& x, size_t from, double f0, double tolerance = 40.0)
+    {
+        constexpr int order = 15, size = 1 << order;
+        juce::dsp::FFT fft (order);
+        std::vector<float> data (2 * size, 0.0f);
+        for (int i = 0; i < size && from + (size_t) i < x.size(); ++i)
+        {
+            const auto t = 2.0 * juce::MathConstants<double>::pi * i / size;
+            const auto w = 0.35875 - 0.48829 * std::cos (t) + 0.14128 * std::cos (2 * t) - 0.01168 * std::cos (3 * t);
+            data[(size_t) i] = x[from + (size_t) i] * (float) w;
+        }
+        fft.performFrequencyOnlyForwardTransform (data.data());
+        double right = 0.0, wrong = 0.0;
+        for (int bin = 1; bin < size / 2; ++bin)
+        {
+            const auto hz = bin * rate / size;
+            const auto harmonic = std::round (hz / f0);
+            const auto e2 = (double) data[(size_t) bin] * data[(size_t) bin];
+            if (harmonic >= 1.0 && std::abs (hz - harmonic * f0) < tolerance) right += e2;
+            else wrong += e2;
+        }
+        return 10.0 * std::log10 ((wrong + 1.0e-30) / (right + 1.0e-30));
+    }
+
     float maxStep (const std::vector<float>& x)
     {
         float m = 0.0f;
@@ -146,23 +173,25 @@ public:
             }
         }
 
-        beginTest ("Interpolation accuracy on a 1 kHz sine");
+        beginTest ("Interpolation accuracy on a 1 kHz sine (2x oversampled copy)");
         {
-            std::vector<float> s (4096);
-            for (size_t i = 0; i < s.size(); ++i) s[i] = std::sin (2.0f * juce::MathConstants<float>::pi * 1000.0f * (float) i / 48000.0f);
-            thf::grain::dsp::SincTable sinc;
-            float errH = 0.0f, errS = 0.0f;
-            for (int i = 100; i < 4000; ++i)
-                for (float f : { 0.25f, 0.5f, 0.75f })
+            constexpr float storageRate = 96000.0f;
+            std::vector<float> s (8192);
+            for (size_t i = 0; i < s.size(); ++i) s[i] = std::sin (2.0f * juce::MathConstants<float>::pi * 1000.0f * (float) i / storageRate);
+            const thf::grain::dsp::GrainKernel normal { 7.0, 0.8 };
+            const thf::grain::dsp::GrainKernelHq hq { 9.0, 0.8 };
+            float errN = 0.0f, errH = 0.0f;
+            for (int i = 100; i < 8000; ++i)
+                for (float f : { 0.1f, 0.25f, 0.5f, 0.77f, 0.999f })
                 {
-                    const auto truth = std::sin (2.0f * juce::MathConstants<float>::pi * 1000.0f * ((float) i + f) / 48000.0f);
-                    errH = std::max (errH, std::abs (thf::grain::dsp::hermite (s.data() + i, f) - truth));
-                    errS = std::max (errS, std::abs (sinc.read (s.data() + i, f, 1.0f) - truth));
+                    const auto truth = std::sin (2.0f * juce::MathConstants<float>::pi * 1000.0f * ((float) i + f) / storageRate);
+                    errN = std::max (errN, std::abs (normal.read (s.data() + i, f) - truth));
+                    errH = std::max (errH, std::abs (hq.read (s.data() + i, f) - truth));
                 }
-            logMessage ("  Hermite max error " + juce::String (juce::Decibels::gainToDecibels (errH), 1) + " dB, sinc "
-                        + juce::String (juce::Decibels::gainToDecibels (errS), 1) + " dB");
-            expectLessThan (errH, 2.0e-4f);   // < -74 dB
-            expectLessThan (errS, 2.0e-3f);   // Kaiser window ripple, < -54 dB at 1 kHz
+            logMessage ("  8-tap max error " + juce::String (juce::Decibels::gainToDecibels (errN), 1) + " dB, 12-tap "
+                        + juce::String (juce::Decibels::gainToDecibels (errH), 1) + " dB");
+            expectLessThan (errN, 3.0e-4f);   // < -70 dB
+            expectLessThan (errH, 1.0e-4f);   // < -80 dB
         }
 
         beginTest ("Pitch: note - root sets the grain pitch (same and different sample rates)");
@@ -241,6 +270,327 @@ public:
                 expectLessThan (octaveDb, -50.0);
                 expectLessThan (fifthDb, hq ? -40.0 : -30.0);
             }
+        }
+
+        beginTest ("Aliasing grid: 1 kHz saw at +1..+11 semitones, wrong energy below -60 dB");
+        {
+            // Band-limited saw (harmonics below 24 kHz only).
+            juce::AudioBuffer<float> b (1, (int) rate * 3);
+            for (int i = 0; i < b.getNumSamples(); ++i)
+            {
+                double v = 0.0;
+                for (int k = 1; k * 1000 < 24000; ++k)
+                    v += std::sin (2.0 * juce::MathConstants<double>::pi * 1000.0 * k * i / rate) / k;
+                b.setSample (0, i, (float) (0.3 * v));
+            }
+            auto saw = SourceData::fromBuffer (b, rate, "saw");
+            double worst = -300.0;
+            for (int semis = 1; semis <= 11; ++semis)
+            {
+                GrainEngine e;
+                e.prepare (rate);
+                e.setSource (saw.get());
+                auto p = plain();
+                p.sizeMs = 500.0f;
+                p.density = 4.0f;
+                p.scan = 1.0f;
+                p.position = 0.1f;
+                e.noteOn (60 + semis, 1.0f, p);
+                const auto out = render (e, p, (int) rate + (1 << 15));
+                worst = std::max (worst, offHarmonicDb (out, (size_t) rate / 2, 1000.0 * std::exp2 (semis / 12.0)));
+            }
+            logMessage ("  worst wrong energy " + juce::String (worst, 1) + " dB");
+            expectLessThan (worst, -60.0);
+        }
+
+        beginTest ("Aliasing: a 0.2 fs sine pitched by 2^1.45 vanishes, by 1.35 stays clean");
+        {
+            auto src = sineSource (0.2 * rate, 3.0);
+            auto run = [&src] (double ratio)
+            {
+                GrainEngine e;
+                e.prepare (rate);
+                e.setSource (src.get());
+                auto p = plain();
+                p.sizeMs = 200.0f;
+                p.density = 15.0f;
+                p.pitch = (float) (12.0 * std::log2 (ratio));
+                e.noteOn (60, 1.0f, p);
+                return render (e, p, (int) rate / 2 + (1 << 15));
+            };
+            const auto reference = rms (run (1.0), (size_t) rate / 2);
+            const auto aboveDb = juce::Decibels::gainToDecibels (rms (run (std::exp2 (1.45)), (size_t) rate / 2) / reference, -200.0);
+            // Grain windows spread the tone by a few tens of Hz: everything further away is error.
+            const auto cleanDb = offHarmonicDb (run (1.35), (size_t) rate / 2, 0.2 * rate * 1.35, 150.0);
+            logMessage ("  x2^1.45 (above Nyquist): " + juce::String (aboveDb, 1) + " dB, x1.35: error " + juce::String (cleanDb, 1) + " dB");
+            expectLessThan (aboveDb, -60.0);
+            expectLessThan (cleanDb, -60.0);
+        }
+
+        beginTest ("Note-on attack: a Future Stab cloud is at full level within 20 ms");
+        {
+            auto src = sources::generate (7);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.spray = 0.01f; p.sizeMs = 350.0f; p.density = 25.0f; p.chaos = 0.2f; p.position = 0.0f;
+            p.attackMs = 2.0f; p.sustain = 1.0f;
+            e.noteOn (60, 1.0f, p);
+            const auto out = render (e, p, (int) rate * 2);
+            const std::vector<float> early (out.begin() + (int) (0.01 * rate), out.begin() + (int) (0.02 * rate));
+            const std::vector<float> steady (out.begin() + (int) rate, out.end());
+            const auto db = juce::Decibels::gainToDecibels (rms (early) / rms (steady));
+            logMessage ("  10..20 ms vs steady: " + juce::String (db, 1) + " dB");
+            expectGreaterThan (db, -3.0);
+        }
+
+        beginTest ("Drive: no step leaving zero, flat response at low drive");
+        {
+            // A 1 kHz + 15 kHz pair through the drive stage alone.
+            auto measure = [] (float amount, double freq)
+            {
+                thf::grain::dsp::DriveStage d;
+                d.prepare (rate);
+                std::vector<float> l (32), r (32);
+                double c = 0.0, s = 0.0;
+                int n = 0;
+                for (int block = 0; block < 3000; ++block)
+                {
+                    for (int i = 0; i < 32; ++i)
+                        l[(size_t) i] = r[(size_t) i] = 0.1f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * freq * (block * 32 + i) / rate);
+                    d.process (l.data(), r.data(), 32, amount, amount);
+                    if (block >= 1500)
+                        for (int i = 0; i < 32; ++i, ++n)
+                        {
+                            const auto ph = 2.0 * juce::MathConstants<double>::pi * freq * (block * 32 + i) / rate;
+                            c += l[(size_t) i] * std::cos (ph);
+                            s += l[(size_t) i] * std::sin (ph);
+                        }
+                }
+                return 2.0 * std::sqrt (c * c + s * s) / n;
+            };
+            const auto zero1k = measure (0.0f, 1000.0), tiny1k = measure (0.002f, 1000.0);
+            const auto jump = juce::Decibels::gainToDecibels (tiny1k / zero1k);
+            const auto low1k = measure (0.05f, 1000.0), low15k = measure (0.05f, 15000.0);
+            const auto zero15k = measure (0.0f, 15000.0);
+            const auto tilt = juce::Decibels::gainToDecibels ((low15k / low1k));
+            const auto flat = juce::Decibels::gainToDecibels (zero15k / zero1k);
+            logMessage ("  0 -> 0.002: " + juce::String (jump, 3) + " dB; 15 kHz vs 1 kHz at 0.05: " + juce::String (tilt, 2)
+                        + " dB, at 0: " + juce::String (flat, 2) + " dB");
+            expectLessThan (std::abs (jump), 0.1);
+            expectGreaterThan (tilt, -0.5);
+            expectLessThan (std::abs (flat), 0.5);
+        }
+
+        beginTest ("Coherent grains are as loud as random ones (+/- 1.5 dB)");
+        {
+            auto src = noiseSource (10.0);
+            auto level = [&src] (bool coherent)
+            {
+                GrainEngine e;
+                e.prepare (rate);
+                e.setSource (src.get());
+                auto p = plain();
+                p.sizeMs = 120.0f;
+                p.density = 60.0f;
+                p.chaos = coherent ? 0.0f : 1.0f;
+                p.spray = coherent ? 0.0f : 1.0f;
+                p.scan = coherent ? 1.0f : 0.0f;
+                e.noteOn (60, 1.0f, p);
+                return rms (render (e, p, (int) rate * 3), (size_t) rate);
+            };
+            const auto db = juce::Decibels::gainToDecibels (level (true) / level (false));
+            logMessage ("  coherent vs random: " + juce::String (db, 2) + " dB");
+            expectWithinAbsoluteError (db, 0.0, 1.5);
+        }
+
+        beginTest ("Density changes apply at once (0.5 -> 50 Hz: next grain within 40 ms)");
+        {
+            auto src = noiseSource (4.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.density = 0.5f;
+            p.sizeMs = 20.0f;
+            e.noteOn (60, 1.0f, p);
+            render (e, p, (int) (0.1 * rate));
+            GrainEvent events[64];
+            e.popGrainEvents (events, 64);
+            p.density = 50.0f;
+            int waited = 0;
+            bool found = false;
+            std::vector<float> l (48), r (48);
+            while (waited < (int) (0.2 * rate) && ! found)
+            {
+                e.render (l.data(), r.data(), 48, p);
+                waited += 48;
+                found = e.popGrainEvents (events, 64) > 0;
+            }
+            logMessage ("  first grain after " + juce::String (waited * 1000.0 / rate, 1) + " ms");
+            expect (found && waited <= (int) (0.04 * rate));
+        }
+
+        beginTest ("Sync: onsets sit on the host beat grid, chord notes together");
+        {
+            auto src = noiseSource (4.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.sync = true;
+            p.syncBeats = 0.25;
+            p.bpm = 120.0;
+            p.sizeMs = 50.0f;
+            const double startPpq = 3.1;
+            e.setTransport (true, startPpq);
+            for (int note : { 60, 64, 67 })
+                e.noteOn (note, 1.0f, p);
+            std::vector<float> l (512), r (512);
+            std::vector<GrainEvent> all;
+            for (int b = 0; b < 100; ++b)
+            {
+                e.render (l.data(), r.data(), 512, p);
+                GrainEvent ev[256];
+                const auto n = e.popGrainEvents (ev, 256);
+                all.insert (all.end(), ev, ev + n);
+            }
+            const auto samplesPerBeat = rate * 60.0 / p.bpm;
+            int onGrid = 0, offGrid = 0;
+            std::map<int64_t, int> perTime;
+            for (const auto& ev : all)
+            {
+                if (ev.time == 0) continue;            // the note-on grains
+                const auto beat = startPpq + (double) ev.time / samplesPerBeat;
+                const auto nearest = std::round (beat / p.syncBeats) * p.syncBeats;
+                if (std::abs ((beat - nearest) * samplesPerBeat) <= 1.0) ++onGrid; else ++offGrid;
+                ++perTime[ev.time];
+            }
+            int together = 0;
+            for (auto& [t, count] : perTime) together += count == 3 ? 1 : 0;
+            logMessage ("  on grid " + juce::String (onGrid) + ", off " + juce::String (offGrid) + ", ticks with all 3 notes "
+                        + juce::String (together) + " of " + juce::String ((int) perTime.size()));
+            expect (onGrid >= 21 && offGrid == 0);
+            expectEquals (together, (int) perTime.size());
+        }
+
+        beginTest ("Link Voices: a chord shares onsets and random choices");
+        {
+            auto src = noiseSource (4.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.linkVoices = true;
+            p.chaos = 0.8f; p.spray = 0.5f; p.stereo = 1.0f; p.reverse = 0.5f;
+            p.density = 30.0f;
+            p.sizeMs = 60.0f;
+            for (int note : { 60, 64, 67 })
+                e.noteOn (note, 1.0f, p);
+            std::map<int64_t, std::vector<GrainEvent>> byTime;
+            std::vector<float> l (512), r (512);
+            for (int b = 0; b < 60; ++b)
+            {
+                e.render (l.data(), r.data(), 512, p);
+                GrainEvent ev[256];
+                const auto n = e.popGrainEvents (ev, 256);
+                for (int i = 0; i < n; ++i) byTime[ev[i].time].push_back (ev[i]);
+            }
+            int groups = 0, matching = 0;
+            for (auto& [t, list] : byTime)
+            {
+                if (t == 0) continue;
+                ++groups;
+                bool same = list.size() == 3;
+                for (auto& ev : list) same = same && std::abs (ev.pan - list[0].pan) < 1.0e-6f && ev.reversed == list[0].reversed;
+                matching += same ? 1 : 0;
+            }
+            logMessage ("  onsets " + juce::String (groups) + ", shared by all three notes " + juce::String (matching));
+            expect (groups > 20);
+            expectEquals (matching, groups);
+        }
+
+        beginTest ("Regular onsets with a flat window: no level ripple");
+        {
+            auto src = noiseSource (6.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.window = 1.0f;
+            p.sizeMs = 150.0f;
+            p.density = 10.0f;            // overlap 1.5
+            p.spray = 1.0f;
+            e.noteOn (60, 1.0f, p);
+            auto out = render (e, p, (int) rate * 4);
+            // Envelope in 5 ms windows over whole grain periods: max/min.
+            double lo = 1e9, hi = 0.0;
+            const int win = (int) (0.005 * rate);
+            for (int start = (int) rate; start + win < (int) out.size(); start += win)
+            {
+                double s = 0.0;
+                for (int i = 0; i < win; ++i) s += out[(size_t) (start + i)] * out[(size_t) (start + i)];
+                lo = std::min (lo, s); hi = std::max (hi, s);
+            }
+            // Noise itself fluctuates in 5 ms windows; compare with a dense random cloud.
+            const auto rippleDb = 10.0 * std::log10 (hi / lo);
+            GrainEngine ref;
+            ref.prepare (rate);
+            ref.setSource (src.get());
+            auto q = p;
+            q.window = 0.0f; q.density = 200.0f; q.chaos = 1.0f;
+            ref.noteOn (60, 1.0f, q);
+            auto refOut = render (ref, q, (int) rate * 4);
+            double rlo = 1e9, rhi = 0.0;
+            for (int start = (int) rate; start + win < (int) refOut.size(); start += win)
+            {
+                double s = 0.0;
+                for (int i = 0; i < win; ++i) s += refOut[(size_t) (start + i)] * refOut[(size_t) (start + i)];
+                rlo = std::min (rlo, s); rhi = std::max (rhi, s);
+            }
+            const auto refDb = 10.0 * std::log10 (rhi / rlo);
+            logMessage ("  5 ms level range " + juce::String (rippleDb, 1) + " dB (dense random cloud: " + juce::String (refDb, 1) + " dB)");
+            expectLessThan (rippleDb, refDb + 3.0);
+        }
+
+        beginTest ("Voice stealing on a bass note and filter type changes do not click");
+        {
+            auto src = sineSource (55.0, 4.0);
+            GrainEngine e;
+            e.prepare (rate);
+            e.setSource (src.get());
+            auto p = plain();
+            p.voices = 1;
+            p.sizeMs = 200.0f;
+            p.density = 20.0f;
+            p.root = 33;
+            e.noteOn (33, 1.0f, p);
+            auto steady = render (e, p, (int) rate);
+            const auto steadyStep = maxStep (steady);
+            e.noteOn (40, 1.0f, p);                     // steals the only voice
+            auto around = render (e, p, (int) (0.05 * rate));
+            logMessage ("  bass steal: steady step " + juce::String (steadyStep, 4) + ", around " + juce::String (maxStep (around), 4));
+            expectLessThan (maxStep (around), steadyStep * 3.0f + 1.0e-3f);
+
+            // A 110 Hz tone through LP 300 Hz (passes) switched to HP 300 Hz (mostly removed):
+            // a hard switch jumps by about the tone's amplitude.
+            auto tone = sineSource (110.0, 4.0);
+            GrainEngine f;
+            f.prepare (rate);
+            f.setSource (tone.get());
+            auto q = plain();
+            q.cutoff = 300.0f;
+            q.sizeMs = 400.0f;
+            q.density = 10.0f;
+            q.root = 60;
+            f.noteOn (60, 1.0f, q);
+            const auto before = render (f, q, (int) rate);
+            q.filterType = 2;
+            const auto after = render (f, q, (int) (0.02 * rate));
+            logMessage ("  LP -> HP: steady step " + juce::String (maxStep (before), 4) + ", at the switch " + juce::String (maxStep (after), 4));
+            expectLessThan (maxStep (after), maxStep (before) * 1.5f);
+
         }
 
         beginTest ("Grain boundaries do not click (Hann and flat windows)");
@@ -375,7 +725,7 @@ public:
             auto s = SourceData::fromBuffer (b, 44100.0, "sine", 48000.0);
             expectEquals (s->getSampleRate(), 48000.0);
             std::vector<float> x ((size_t) s->getLength());
-            std::copy (s->channel (0, 0), s->channel (0, 0) + s->getLength(), x.begin());
+            for (int i = 0; i < s->getLength(); ++i) x[(size_t) i] = s->sample (0, i);
             // Compare against an ideal 1 kHz sine at 48 kHz in the middle (edges excluded).
             double err = 0.0, sig = 0.0;
             for (size_t i = 4800; i + 4800 < x.size(); ++i)
@@ -396,7 +746,7 @@ public:
                 b.setSample (0, i, 0.3f + 0.2f * (float) std::sin ((float) i * 0.05f));
             auto s = SourceData::fromBuffer (b, 48000.0, "dc");
             double mean = 0.0;
-            for (int i = 4800; i < 43200; ++i) mean += s->channel (0, 0)[i];
+            for (int i = 4800; i < 43200; ++i) mean += s->sample (0, i);
             mean /= 38400.0;
             expectLessThan (std::abs (mean), 1.0e-3);
         }
@@ -602,6 +952,10 @@ public:
 
     void runTest() override
     {
+        // The built-in sources are shared by all instances; keep them alive for the whole
+        // run instead of rebuilding them for every processor the tests create.
+        const juce::SharedResourcePointer<FactorySources> keepFactory;
+
         beginTest ("processBlock does not allocate (notes, encoders, faders, pads, bend)");
         {
             GrainProcessor p;
